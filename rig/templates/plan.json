@@ -1,0 +1,9 @@
+{
+ "passes": [
+  { "name": "counts", "role": "counts", "order": "AB", "args": { "k": 1, "rates": "1", "warmup": 0, "cfg": { "fiberStats": true } }, "purpose": "Deterministic counts (React commits, rendered and mounted fibers, layouts, the scenario's own) confirm the mechanism. Instrumented: no timing claims." },
+  { "name": "pilot", "role": "trial", "order": "AB", "args": { "k": 1, "rates": "4", "warmup": 0 }, "purpose": "One short trial: both sides run, the per-iteration time feeds the ETA, a first look at the spread. Give it a smaller workload through the scenario's size knob if it has one (\"cfg\": { … })." },
+  { "name": "main", "role": "timing", "order": "ABBAABBA", "args": { "k": 8, "rates": "4,1", "warmup": 2 }, "purpose": "The timing verdict: 4 v 4 sessions at 4x and 1x." },
+  { "name": "ctl", "role": "control", "order": "ABBA", "args": { "k": 8, "rates": "4", "warmup": 2, "altInject": 10 }, "purpose": "Paired control: 0 / 10 ms injected per unit of work inside each session must land (k 8, warm-up 2: 3 pairs a session)." },
+  { "name": "more", "role": "timing", "extends": "main", "order": "ABBA", "optional": true, "purpose": "One more ABBA block of main (sessions main-5-A …). Runs only with --only=more, when aggregate's advice says more sessions could change a verdict." }
+ ]
+}

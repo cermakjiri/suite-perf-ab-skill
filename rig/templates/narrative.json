@@ -1,0 +1,12 @@
+{
+ "pageTitle": "PR 12345 perf A/B",
+ "title": "PR #12345: <one line on what changed and what it did>",
+ "summary": "<Two or three sentences: the verdict first, regressions before wins, what was measured and on what.>",
+ "verdicts": [
+  { "label": "<metric, size, CPU rate>", "big": "−42%", "from": "1.20 s → 0.70 s", "why": "<mechanism in one sentence; session separation and p>", "tone": "better" }
+ ],
+ "findings": ["<html allowed: what moved, why (attribution), what did not move>"],
+ "caveats": ["<anything a reviewer must know beyond the automatic caveats>"],
+ "sections": [{ "title": "Root cause", "html": "<p>…</p>" }],
+ "passLabels": { "main": "<scenario, size>", "ctl": "Injected-cost control" }
+}

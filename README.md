@@ -2,40 +2,55 @@
 
 > **Status: alpha.** Shared for early testing. Expect rough edges, and please report what breaks.
 
-An [Agent Skill](https://agentskills.io) that measures **Trezor Suite web** runtime performance on a
-branch or PR against `develop`, by driving both preview builds in a real Chrome through the
-[Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) server.
+An [Agent Skill](https://agentskills.io) that measures **Trezor Suite** runtime performance — web
+and the Electron desktop app — on a branch or PR against `develop`, with a reusable Playwright rig.
+Each run writes only its scenario; building, launching, seeding, throttling, statistics and the
+report are shared.
 
 It is tool-agnostic: the same folder works in **Claude Code** and in **GitHub Copilot**
 (CLI, VS Code agent mode, coding agent, code review).
 
 ## What it does
 
-- Reads the diff and works out which UI surfaces are actually affected, instead of trusting the PR
-  description.
-- Seeds both branches into an **identical synthetic wallet state** from the page itself — no device,
-  emulator, Docker or backend needed.
-- Replays each scenario **≥12 kept iterations** per branch, at **1x and 4x CPU throttling**, and
-  reports **p75** with the spread.
-- Covers the whole SPA picture: React render volume, main-thread blocking, style and layout, paint
-  and dropped frames, memory growth across repeated navigation, and cold boot.
-- Reports deltas **in both directions**, plus an explicit caveats section. A report that only
-  confirms the PR's claim has not been checked.
+- Reads the diff and works out which UI surfaces and problem classes are affected, instead of
+  trusting the PR description.
+- Builds both revisions (merge-base and PR head) as production builds in copy-on-write clones,
+  cached by commit, and proves which build each session ran with a code marker.
+- Seeds both sides into an **identical wallet state**: synthetic store state with a mocked backend
+  (default), or a **trezor-user-env emulator** with Suite's real connect, discovery and live
+  backends for real data.
+- Replays the scenario in **page sessions alternated ABBA**, at **4x and 1x CPU**, reading
+  main-thread CPU per phase over CDP (thread ticks) next to long tasks, frames, input delay, INP,
+  React commits and memory.
+- Treats the **session as the unit**: a timing difference is called only when the sessions
+  separate (permutation p), with a paired injected-cost control proving the metric can move.
+- On Apple silicon, starts every measured iteration on a **performance core**: it waits for free
+  performance cores and a renderer at full clock, and discards and retries an iteration whose main
+  thread another program's load or a demotion pushes onto efficiency cores, so a busy machine
+  mostly costs waiting (contention under ~100 ms goes unseen: quieter is still cleaner). macOS's
+  own placement of light work on efficiency cores is kept and reported per side.
+- Writes a self-contained HTML report — regressions first, both directions, attribution, caveats.
+- Optional: keeps one side open on CDP :9222 for the **Playwright MCP** and the
+  **chrome-devtools(-electron) MCP** to explore, trace and heap-snapshot (never to time).
 
 ## What it will not do
 
-Write the optimization or fix the slow code, profile suite-native or the Electron desktop shell,
-time builds/CI/jest, compare bundle sizes, or summarize what a branch changed.
+Write the optimization or fix the slow code, profile suite-native, time builds/CI/jest, compare
+bundle sizes (that is `suite-bundle-ab`), or summarize what a branch changed.
 
 ## Requirements
 
 | | |
 | --- | --- |
-| A `trezor-suite` checkout | the skill reads the diff with `git` and cites the repo's own `skills/performance-*` rules |
-| Google Chrome | the MCP server launches its own instance |
-| Node.js ≥ 18 | the three analysis scripts are zero-dependency CommonJS (`fs`, `path`, `zlib`) |
-| Network access to `dev.suite.sldev.cz` | it compares deployed preview builds, not local dev builds |
-| Chrome DevTools MCP connected | see [step 2](#2-connect-the-chrome-devtools-mcp-server-required) — nothing works without it |
+| A `trezor-suite` checkout with `node_modules` (`yarn`) | the rig takes `playwright-core`, Chromium and Electron from it and clones it per revision |
+| macOS on APFS | revisions are built in `clonefile()` copy-on-write clones (~20 s, ~1-2 GiB each once built) |
+| Node.js 24 (latest LTS), Python 3 | the rig is zero-dependency ES modules (`.mjs`) written for the latest Node LTS; builds use each revision's `.nvmrc` Node when nvm has it; `clone.py` uses ctypes |
+| Playwright Chromium (`yarn playwright install chromium`) | web sessions run headless |
+| clang (Xcode Command Line Tools) | builds the performance-core helper (`rig/native/pcore.c`) on first use; without it the gate is off |
+| Docker Desktop | only for `device: emulator` (trezor-user-env) |
+| MCP servers (optional) | `playwright` / `chrome-devtools-electron` attached to `127.0.0.1:9222`, `trezor-emulator` on `:9003` — see `references/mcp.md` |
+
+Runs and clones live in `$PERF_AB_HOME` (default `~/.local/share/suite-perf-ab`).
 
 ---
 
@@ -87,56 +102,19 @@ echo ".github/skills/suite-perf-ab/" >> .git/info/exclude
 
 ---
 
-## 2. Connect the Chrome DevTools MCP server (required)
+## 2. MCP servers (optional)
 
-The skill drives the browser entirely through this server. Without it, it cannot run at all.
-
-### Claude Code
-
-```bash
-claude mcp add chrome-devtools -s user -- npx chrome-devtools-mcp@latest
-```
-
-Confirm with `/mcp` — you want `chrome-devtools` listed as connected.
-
-### Copilot CLI
+Measurement needs no MCP. For exploring a build, attach to the session `rig/open.mjs` keeps open on
+CDP `127.0.0.1:9222`:
 
 ```bash
-copilot mcp add chrome-devtools -- npx chrome-devtools-mcp@latest
+claude mcp add playwright -- <trezor-suite>/node_modules/.bin/playwright mcp --cdp-endpoint=http://127.0.0.1:9222
+claude mcp add chrome-devtools-electron -- npx chrome-devtools-mcp@latest --browserUrl http://127.0.0.1:9222
+claude mcp add --transport sse trezor-emulator http://127.0.0.1:9003/sse     # served by trezor-user-env
 ```
 
-Equivalent hand edit of `~/.copilot/mcp-config.json`:
-
-```json
-{
-  "mcpServers": {
-    "chrome-devtools": {
-      "type": "local",
-      "command": "npx",
-      "args": ["chrome-devtools-mcp@latest"],
-      "env": {},
-      "tools": ["*"]
-    }
-  }
-}
-```
-
-### VS Code (Copilot agent mode)
-
-Create `.vscode/mcp.json`:
-
-```json
-{
-  "servers": {
-    "chrome-devtools": {
-      "command": "npx",
-      "args": ["chrome-devtools-mcp@latest"]
-    }
-  }
-}
-```
-
-Click **Start** above the server entry, and make sure Chat is in **Agent** mode.
+The DevTools MCP enables the V8 debugger on every page it attaches to (array spreads ~25x slower),
+so numbers are never taken from an MCP-attached page.
 
 ---
 
@@ -156,19 +134,24 @@ In Claude Code you can also invoke it explicitly:
 /suite-perf-ab perf/accounts-list
 ```
 
-Both the branch and `develop` need a preview deployment at
-`https://dev.suite.sldev.cz/suite-web/<branch-name>/web/` — the skill checks this first, and a
-missing preview is the most common way a run stalls.
+The skill builds the PR head and its merge-base locally (no preview deployments needed), writes
+the scenario, runs the core checks (counts and a short pilot), then the timing plan in the
+background (~25 min for the default plan), drafts the report, and adds sessions only when they
+could change a verdict. Desktop: ask for it ("…on desktop too"). Real device and data: ask for the
+emulator ("…with a real wallet / with trezor-user-env").
 
-Expect a **long, mostly unattended run**: every scenario is replayed at least 12 times per branch
-per throttling level, and traces are recorded for each.
+To see where a run stands — stage, session, iteration, ETA and finish time — run this in your own
+terminal:
+
+```bash
+node ~/.claude/skills/suite-perf-ab/rig/status.mjs --run=<id> --watch
+```
 
 ### What you get
 
-A report with a scenario per suspected problem class, p75 per metric with min/p50/max so you can see
-the spread, wins and regressions both listed, the fix cited from the repo's own performance skills
-where one applies, and a caveats section stating what was synthetic and what the measurement could
-not see.
+A report with verdict cards, one table per pass and CPU rate (session medians as dots, so you can
+see whether the sessions separate), controls, build provenance and rig health per side, caveats,
+and the method. The run folder keeps every session's raw JSON, so any number can be re-derived.
 
 ---
 
@@ -176,17 +159,15 @@ not see.
 
 | Path | What it is |
 | --- | --- |
-| `SKILL.md` | the skill itself — the 8-phase measurement protocol |
-| `references/problem-classes.md` | the six ways an SPA regresses, and which scenario exposes each |
-| `references/house-rules.md` | maps findings onto Trezor Suite's own performance rules |
-| `references/seeding.md` | driving the app into a realistic state without a device |
-| `references/pitfalls.md` | read this whenever a number looks wrong |
-| `assets/harness-core.js` | in-page measurement primitives + the adapter contract |
-| `assets/adapters/suite-web.js` | Suite-web selectors, state seeding and scenarios |
-| `assets/harness.js` | the bundle injected into the page |
-| `scripts/p75.js` | percentiles over in-page iteration records |
-| `scripts/iter-report.js` | slices a trace into the marked per-iteration windows |
-| `scripts/analyze-trace.js` | full DevTools category breakdown of a trace (`--aggregate`, `--compare`) |
+| `SKILL.md` | the workflow |
+| `rig/` | the reusable rig: `preflight`, `build`, `run` (one session), `plan` (ABBA, resumable, with heartbeats and an ETA), `status` (where a run stands, at once), `aggregate` (statistics and advice), `report`, `open` (MCP exploration), `tenv` (emulator), `attr` (profile attribution), `cleanup`; `page/core.js` (in-page probes and helpers); `templates/` |
+| `examples/` | worked scenarios: `history-load` (web, store seed + mocked backend + real thunk), `account-switch` (web + desktop, trusted clicks), `emulator-accounts` (real device and data) |
+| `references/rig.md` | every script's flags, run.json / plan.json / scenario contract, outputs, metric names |
+| `references/desktop.md`, `emulator.md`, `mcp.md` | the desktop target, trezor-user-env, exploring with the MCPs |
+| `references/problem-classes.md`, `house-rules.md` | diff → suspects → scenarios; fixes cited from Suite's own rules |
+| `references/seeding.md`, `pitfalls.md` | store seeding; every trap that produced a wrong answer once |
+| `scripts/analyze-trace.mjs` | DevTools trace category breakdown (works on MCP traces) |
+| `assets/`, `scripts/p75.mjs`, `scripts/iter-report.mjs` | the older DevTools-MCP-only harness |
 
 ## Update
 
@@ -198,10 +179,11 @@ git -C ~/.claude/skills/suite-perf-ab pull
 
 ## Alpha notes
 
-- Only Suite **web** is supported. `assets/adapters/suite-web.js` is the single adapter; another
-  surface means writing another one (the contract is documented at the top of `harness-core.js`).
-- It compares **deployed preview builds**. Local dev builds have different performance
-  characteristics and are not comparable against a deployed one.
-- Chrome only.
+- macOS only (APFS clones, Electron's macOS paths); Chromium and Electron only.
+- Desktop: one visible Electron window per session (no headless Electron); do not use the Mac
+  during a desktop plan. Desktop bundles keep most Suite thunks module-internal, so desktop
+  scenarios drive the UI (`examples/account-switch`).
+- Emulator runs depend on live backends unless you use the regtest sidecar: compare CPU and counts,
+  not wall times.
 - Found something wrong, or a scenario it should cover?
   [Open an issue](https://github.com/cermakjiri/suite-perf-ab-skill/issues).

@@ -1,0 +1,11 @@
+{
+ "passes": [
+  { "name": "counts", "role": "counts", "order": "AB", "args": { "k": 1, "rates": "1", "warmup": 0, "cfg": { "countIdb": true, "fiberStats": true } } },
+  { "name": "pilot", "role": "trial", "order": "AB", "args": { "k": 1, "rates": "4", "warmup": 0, "cfg": { "pages": 10 } } },
+  { "name": "h20", "role": "timing", "order": "ABBAABBA", "args": { "k": 8, "rates": "4,1", "warmup": 2, "cfg": { "pages": 20 } } },
+  { "name": "ctl", "role": "control", "order": "ABBA", "args": { "k": 8, "rates": "4", "warmup": 2, "altInject": 10, "cfg": { "pages": 20 } } },
+  { "name": "h40", "role": "timing", "order": "ABBA", "args": { "k": 6, "rates": "4,1", "warmup": 2, "cfg": { "pages": 40 } } },
+  { "name": "norem", "role": "timing", "order": "AB", "args": { "k": 6, "rates": "4", "warmup": 2, "cfg": { "pages": 20, "remember": false } } },
+  { "name": "more", "role": "timing", "extends": "h20", "order": "ABBA", "optional": true }
+ ]
+}

@@ -4,13 +4,27 @@ Suite web can be put into any wallet state from the page itself. This is not a h
 missing emulator — it is strictly better for profiling, because the state is byte-identical on both
 branches, arbitrary in size, and takes a second rather than a discovery cycle.
 
-`assets/adapters/suite-web.js` implements everything here. Read this file when you need to extend it
-— more networks, transactions, a different device model — or when seeding fails and you need to know
-which gate you tripped.
+`examples/history-load/page.js` and `examples/account-switch/page.js` implement everything here
+for the rig (the older `assets/adapters/suite-web.js` for the MCP-only harness). Read this file when
+you need to extend a seed — more networks, transactions, a different device model — or when seeding
+fails and you need to know which gate you tripped.
+
+Rig specifics, measured 2026-10:
+
+- `window.__H.store()` finds the store on both targets: `window.store` (web with `window.Playwright`,
+  desktop with the `--expose-store` switch the rig passes), else the react-redux Provider in the
+  React tree. Desktop has no `window.TrezorConnect`: `__H.connect()` returns the bundle's
+  `@trezor/connect-electron` object, whose methods can be replaced like web's.
+- Stored transactions go into the same payload: `txs: [{ tx: { ...connectTx, descriptor, symbol,
+  deviceState }, order }]` (`storageLoadTransactions` in `packages/suite/src/support/extraDependencies.ts`
+  groups them by account key, `order` is the index).
+- Missing payload keys make the seed no-op silently — see "Seeding and the app" in pitfalls.md.
+- Seed from `__A.seed()`, which the runner calls as soon as the store exists, before Suite finishes
+  init; `__A.isReady()` (default `__H.suiteReady()`) then waits for lifecycle ready.
 
 ## The seam
 
-`packages/suite-web/src/support/usePlaywright.ts`:
+`suite/web-app/src/support/usePlaywright.ts`:
 
 ```ts
 export const usePlaywright = () => {

@@ -2,7 +2,7 @@
 /**
  * Percentile summary over the per-iteration records produced by assets/harness.js.
  *
- *   node p75.js --label="develop mount 4x" --warmup=3 [--p=75] records.json [--out=summary.json]
+ *   node p75.mjs --label="develop mount 4x" --warmup=3 [--p=75] records.json [--out=summary.json]
  *
  * `records.json` is whatever an `m1`/`m2f`/`m2g`/`m3` run returned — save it straight from
  * evaluate_script's `filePath` argument. Any wrapper object is unwrapped as long as it contains
@@ -12,7 +12,7 @@
  * n=12, p75 is the 9th smallest value. Every metric also reports p50/min/max so the reader can see
  * the spread rather than trusting a single number.
  */
-const fs = require('fs');
+import fs from 'node:fs';
 
 const args = process.argv.slice(2);
 const opt = (name, dflt) => {
@@ -25,7 +25,7 @@ const warmup = Number(opt('warmup', 3));
 const pct = Number(opt('p', 75));
 
 if (!files.length) {
-    console.error('usage: node p75.js [--label=NAME] [--warmup=3] [--p=75] records.json [--out=summary.json]');
+    console.error('usage: node p75.mjs [--label=NAME] [--warmup=3] [--p=75] records.json [--out=summary.json]');
     process.exit(1);
 }
 

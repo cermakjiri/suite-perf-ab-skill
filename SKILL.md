@@ -1,267 +1,272 @@
 ---
 name: suite-perf-ab
 description: >
-  Measure and compare runtime performance of a Trezor Suite web branch or PR against develop by
-  driving both in a real browser with the Chrome DevTools MCP: it seeds identical synthetic wallet
-  state, auto-detects the affected UI surfaces from the git diff instead of trusting the PR
-  description, replays each interaction 15 times at 1x and 4x CPU throttling, and reports p75 with
-  deltas in both directions. It covers the whole single-page-app picture — React render volume,
-  main-thread blocking, style and layout, paint and dropped frames, memory growth across repeated
-  navigation, and cold boot cost. Use it whenever someone wants to benchmark, profile, or A/B a
-  Suite branch or PR, verify or challenge a perf claim before approving or merging, ask whether a
-  change made Suite faster, slower, janky or leaky, check how a surface holds up with a large
-  seeded wallet, or raises render and scripting time, React commits or re-renders, wasted renders,
-  total blocking time, forced reflow, style recalculation, jank, dropped frames, INP, memory leaks,
+  Measure and compare runtime performance of a Trezor Suite branch or PR against develop, on web
+  and on the Electron desktop app, with a reusable Playwright rig: both revisions are built in
+  copy-on-write clones, every page session seeds identical wallet state (synthetic store state, or a
+  trezor-user-env emulator with real backends), the interaction is replayed at 4x and 1x CPU in ABBA
+  session order, and the report compares session medians with main-thread CPU, long tasks, frames,
+  input delay, React commits and memory, deltas in both directions. A run only writes its scenario.
+  Use it whenever someone wants to benchmark, profile, or A/B a Suite branch or PR, verify or
+  challenge a perf claim before approving or merging, ask whether a change made Suite (web or
+  desktop) faster, slower, janky or leaky, check how a surface holds up with a large seeded wallet,
+  or raises render and scripting time, React commits or re-renders, total blocking time, forced
+  reflow, style recalculation, jank, dropped frames, INP, memory growth, IndexedDB/persistence cost
   or DOM size for a Suite change — even without the word "profile", and even when they only
-  advertise a win, since catching unmeasured regressions is half the job. It only measures and
-  compares in-browser web Suite: do not use it to write the optimization, fix the slow code,
-  profile suite-native or the Electron desktop shell, time builds, CI, or jest runs, compare bundle
-  sizes, debug flaky tests, audit a public site, add a JS microbenchmark, or merely summarize what
-  a branch changed.
+  advertise a win, since catching unmeasured regressions is half the job. Also for exploring a
+  build interactively through the Playwright MCP or the chrome-devtools(-electron) MCP before
+  measuring. It only measures and compares: do not use it to write the optimization, fix the slow
+  code, profile suite-native, time builds, CI or jest runs, compare bundle sizes (suite-bundle-ab),
+  debug flaky tests, audit a public site, add a JS microbenchmark, or merely summarize a branch.
 ---
 
-# Suite single-page-app performance A/B
+# Suite performance A/B
 
 Measure a branch against `develop` and say, with numbers a reviewer can trust, what got faster,
-what got slower, and what did not move.
+what got slower, and what did not move — on web, on desktop, or both.
 
-Recording a trace is the easy part. The work is getting two builds into an **identical, realistic
-state** without a device, choosing scenarios that actually exercise what changed, and collecting
-enough samples that the answer is a distribution rather than an anecdote.
+Everything but the scenario is in `rig/` (reference: `references/rig.md`). A run writes two files
+— the scenario's Node part and its in-page part — and a run definition; building, launching,
+seeding order, throttling, probes, sessions, statistics and the report are shared. A typical run:
+~10 min to build and write the scenario, ~25 min of unattended timing, ~10 min to read and report.
 
 ## What a good run produces
 
-- A scenario per suspected problem class, each isolating one interaction.
-- p75 over **≥12 kept iterations** per scenario per branch per throttling level, warm-ups discarded.
-- A 1x and a 4x CPU pass, because a fast Mac hides regressions real users feel.
-- Deltas in both directions. A report that only confirms the PR's claim has not been checked.
-- An explicit caveats section: what was synthetic, what n was, what the measurement could not see.
+- A build pair proven comparable: production builds of pinned SHAs made with the same command,
+  no coverage instrumentation, a code marker per side that proves which build ran.
+- One scenario per suspected problem class, isolating one interaction, with fresh data per iteration.
+- ≥4 page sessions per side in ABBA order at 4x and 1x CPU. **The session is the unit**: iterations
+  inside one session are correlated (same-build sessions differ up to 2x at 4x), so a timing
+  difference is called only when every session median of one side lies beyond the other's (4 v 4
+  separated: p 0.029). Counts (commits, rows, layouts) need no such care.
+- A paired injected-cost control that lands (the metric can move) and, where it applies, a negative
+  control (a pass where the change cannot matter reads the same on both sides).
+- Deltas in both directions, attribution for anything that moved, explicit caveats.
 
-## Before you start
+## The rig at a glance
 
-Confirm the Chrome DevTools MCP is connected (`list_pages`). Everything runs through it.
+| Step | Command (all `node <skill>/rig/…`) | Sandbox |
+| --- | --- | --- |
+| Check machine, checkout, builds | `preflight.mjs --run=<id>` | either |
+| Build both sides (clones, cached by SHA) | `build.mjs --run=<id> --targets=web[,desktop]` | on |
+| Explore one side with the MCPs (CDP :9222) | `open.mjs --run=<id> --side=B [--target=desktop]` | **off**, background |
+| One page session | `run.mjs --run=<id> --side=A --out=<f>` | **off** |
+| The whole plan, ABBA, resumable | `plan.mjs --run=<id> [--only=counts,pilot]` | **off**, background |
+| Where it stands: stage, iteration, ETA | `status.mjs --run=<id>` (instant) | on |
+| Session statistics + advice → summary.json | `aggregate.mjs --run=<id>` | on |
+| Self-contained HTML report | `report.mjs --run=<id>` | on |
+| CPU profile → source files | `attr.mjs <x.cpuprofile> --run=<id> --side=A` | on |
+| Emulator (trezor-user-env) | `tenv.mjs up \| prepare \| down` | **off** |
+| Disk | `cleanup.mjs [--clones --older-than=3]` | on |
 
-No device, emulator, Docker or backend is needed. If you find yourself starting `trezor-user-env`,
-stop and read `references/seeding.md` — the app can be driven into any state from the page itself,
-which is faster and far more repeatable.
+Runs live in `$PERF_AB_HOME` (default `~/.local/share/suite-perf-ab`: outside every worktree,
+writable from the sandbox), one folder per run; clones and builds are shared between runs.
 
-## 1. Two comparable builds
+The rig is ES modules (`.mjs`, scenarios included: `export default { … }`) written for the latest
+Node LTS (24). Builds run yarn with the `.nvmrc` Node of the revision being built when nvm has it
+(else the running Node, with a warning), so both sides are built by the same Node.
 
-Every Suite PR gets a preview deployment, and so does develop:
+**Prompts**: ask for everything up front in one batch — the sandbox-off commands above, `git
+fetch`, and any network host the run needs (`dev.suite.sldev.cz` for deployed previews, the
+backends for `network: live`). Never `chmod +x` (it prompts even in bypass mode); run every script
+as `node <file>`.
 
-- branch: `https://dev.suite.sldev.cz/suite-web/<branch-name>/web/` (slashes kept, e.g. `perf/accounts-list`)
-- base: `https://dev.suite.sldev.cz/suite-web/develop/web/`
+**Wait in the background.** Start `build.mjs`, `plan.mjs`, `open.mjs`, `tenv.mjs up` and any step
+longer than about a minute with Bash `run_in_background: true`; the completion notification
+re-invokes you. Never wait in the foreground: no `until …; do sleep …; done`, no repeated status
+polling (the last run lost 120 min to 29 such loops, 7 of them killed at the 10-minute limit).
+After starting a step, tell the user in one line what runs, the estimate and finish time (the
+first line it prints) and the status command.
 
-Both are production builds on the same host, which is what makes them comparable. Check both return
-200 with `curl -o /dev/null -w '%{http_code}' -L` before anything else — a missing preview is the
-most common way a run gets half-finished.
+**Progress.** `node <skill>/rig/status.mjs --run=<id>` answers at once, in ≤ 8 lines: what runs
+(pass, session, stage, rate, iteration, phase), done / failed / to go, elapsed, ETA and finish
+time, the build if one is going, and whether the plan died or stalled. The background task's
+output has a heartbeat line with the stage and the ETA on every stage change and every 30 s. The
+user can run `status.mjs --watch` in their own terminal; never run `--watch` yourself.
 
-Routes are directory-style and **need the trailing slash**: `/accounts/` is 200, `/accounts` is a
-302. Query params go after it, e.g. `/accounts/?symbol=btc&accountIndex=0&accountType=normal`.
+## Workflow
 
-Fall back to local builds only if a preview is genuinely missing; a dev build has different
-performance characteristics and cannot be compared against a deployed one.
-
-## 2. Turn the diff into suspects, then scenarios
+### 1. Preflight and pin the revisions
 
 ```bash
-git fetch origin <branch>
-git diff develop...origin/<branch> --stat
-git diff develop...origin/<branch> -- <each source file>
+git fetch origin pull/<n>/head                           # the PR head, by SHA from here on
+git merge-base origin/develop <pr-head-sha>              # side A: develop at the PR's base
+node <skill>/rig/preflight.mjs                           # load, disk, power, Playwright, port 9222
 ```
 
-Read every changed source file's diff **in full**, and read the surrounding file at both revisions
-(`git show develop:<path>`, `git show origin/<branch>:<path>`) when the diff alone does not say what
-the code did before.
+Side A is the merge-base, not today's develop: exactly the PR's commits apart. Create the run
+folder: `$PERF_AB_HOME/runs/<id>/` with `run.json` and `plan.json` copied from `rig/templates/`.
+Fill `sides.A/B.rev` with SHAs and give each side a **marker** — a string only the PR's code
+contains (a template literal, an action type, an error message the minifier keeps) with the module
+count expected (0 on A, ≥1 on B). The runner refuses a session whose bundle does not match.
 
-Then open `references/problem-classes.md` and work through its two tables. The first names the six
-ways an SPA regresses — main-thread blocking, React render volume, style and layout, paint and
-compositing, memory, load and boot — with the metric and scenario that expose each. The second maps
-what a diff touches onto those classes, so a change to effect dependencies raises *memory* as a
-suspect and not only render volume.
+### 2. Turn the diff into suspects, then scenarios
 
-Write the suspect list down before measuring, and check it again when you write the report. A
-scenario list that only covers one class is how a run reports "no regression" while missing three.
+**Read code through a subagent.** An Explore subagent reads the diff (`git diff <merge-base>
+<pr-head>`: every changed source file in full, the surrounding file at both revisions where the
+diff alone does not say what the code did before) and the code path, and returns a brief: entry
+points, thunks and selectors, testids and routes, the expected mechanism, what to seed. Keep only
+the brief in the main conversation; read a file directly only when you are about to edit it. The
+last run read 1.06M characters of code into the main conversation and compacted three times.
 
-Then scan the same diff against the repo's own performance rules — `skills/performance-complexity`,
-`performance-dom`, `performance-react-hooks`, `performance-scheduling` — using the finding→rule table
-in `references/house-rules.md`. A rule violation is a suspect with a known mechanism, which tells you
-which scenario will expose it: a `.find()` inside a `.map()` over transactions predicts that *update*
-degrades with list size, not that scrolling gets janky. Those same rules are the fix catalogue in
-phase 8, so reading them now pays twice.
+From the brief, work through `references/problem-classes.md` (six ways an SPA regresses × what a
+diff touches) and the repo's `skills/performance-*` rules with `references/house-rules.md` (give
+both to the subagent when the diff is large). Write the suspect list down before measuring. Treat
+the PR description as a hypothesis; a perf PR usually touches shared code whose other consumers
+the author never measured.
 
-Treat the PR description as a hypothesis. It names what the author noticed; a perf PR usually
-touches shared components whose other consumers the author never measured, and that is where
-regressions hide. Derive your own list, then say which surfaces the description missed.
+Pick targets: **web** by default; add **desktop** when the change touches desktop code, IPC,
+Electron-specific paths, or when someone asks about desktop (references/desktop.md). Pick the
+device: **synthetic** (seeded store, mocked backend: deterministic, the default) or **emulator**
+(trezor-user-env, real connect + discovery + live backends: real data, noisier; references/emulator.md).
 
-If a changed surface genuinely cannot be reached without a device flow (parts of trading and
-receive), say so in the report rather than quietly dropping it.
+### 3. Build both sides (in the background while you write the scenario)
 
-## 3. Identical state on both branches
+`node <skill>/rig/build.mjs --run=<id> --targets=web` (add `,desktop`). Per side: copy-on-write
+clone of the main checkout (~20 s), forced checkout of the SHA, optional `patch` (a variant: a
+reverted hunk, a tweaked constant), offline `yarn install --immutable --mode=skip-build` (~3 s),
+then the same build command on both sides (web ~35-60 s, desktop ~55 s) with no Sentry token and
+no `INSTRUMENT_CODE`. A cached SHA builds in 0 s. It writes the build paths into `run.json`, numbers
+its steps (`[A 3/4] web build … (last 0:52)`) and estimates them from earlier builds on this machine.
 
-Read `references/seeding.md`. Suite exposes its Redux store on `window.store` when
-`window.Playwright` is truthy, so an init script can inject a synthetic remembered device and any
-number of accounts before the app finishes booting.
+### 4. Write the scenario
 
-Two properties belong in the report:
+Copy `rig/templates/scenario.mjs` and `page.js` to `<run>/scenario/` and start from the closest example:
 
-- The seed is **byte-identical** on both branches — same device, same accounts, same order.
-- It is **synthetic**: no real device, no passphrase, no wallet, and nothing persists, because the
-  state goes into the store rather than IndexedDB.
+| Example | Shows | Targets |
+| --- | --- | --- |
+| `examples/history-load/` | store seed, mocked TrezorConnect pages, a real thunk from the bundle, IndexedDB probe, load/drain phases, idle correction, counting pass, negative control | web (desktop bundles do not export the thunk) |
+| `examples/account-switch/` | stored transactions in the seed, Node-side phases with trusted clicks (valid INP), size knob | web + desktop |
+| `examples/emulator-accounts/` | real device and live data: settings-only seed, device checks off, waiting for discovery | web + desktop, `device: emulator` |
 
-Match the viewport on both branches (`resize_page`, then verify `innerWidth`/`innerHeight` *and* the
-relevant container's `clientHeight` agree). One pixel of difference changes how many rows render.
+The contract (`references/rig.md`): `seed()` before Suite finishes init, `postInit()` for mocks and
+lookups, measured `phases` that resolve when the user-visible work is done, `after()` that restores
+state and verifies the iteration, `valid()` that drops an iteration that did not do its job.
+`window.__H` gives store/connect access, `findThunk`, `goto`, `waitFor`, `injectCost` and the probes.
+Rules that keep a scenario honest:
 
-## 4. Instrument
+- **One dispatch, not many** — the store renders synchronously per dispatch.
+- **Fresh data per iteration** when the app caches results (index targets by `it.n`, and seed
+  `RUN.iterations + RUN.spares + 1` of them: a discarded iteration is retried with the next `it.n`).
+- **A known start**: every iteration starts at the scenario's `route`. After a discarded attempt the
+  runner restores it with page.js `reset()` (default: `after()`, then the route) and checks it; give
+  a scenario whose phases navigate away a `reset()` (examples/account-switch).
+- **Trusted input** for anything about input responsiveness: a Node-side phase with `page.click` /
+  `page.keyboard`; Event Timing ignores `dispatchEvent`.
+- **Two sizes** for anything size-sensitive (a `cfg` knob, one pass each): flat vs linear is the
+  most convincing result available.
+- Counting instrumentation (patched prototypes, fiber walks) only in its own pass.
 
-The harness is two files, concatenated and passed as the `initScript` argument of `navigate_page`:
+Prototype the in-page part against a live build before the first timing pass: `open.mjs` keeps one
+side open on CDP :9222 with the scenario loaded, and the MCPs attach to it (references/mcp.md):
+the Playwright MCP for testids and `browser_evaluate` of `window.__A.phases.x(…)`, the
+chrome-devtools-electron MCP for a trace or a heap snapshot. **Never take a timing number from an
+MCP-attached page**: the DevTools MCP turns the V8 debugger on, which makes array spreads ~25x
+slower (the env canary shows it: spread/slice ≈ 1 normal, ≈ 25 attached).
+
+### 5. Core checks first, then more only if it can change the result
+
+The template plan runs the core checks in this order: `counts` (AB, k 1, 1x, `fiberStats` on —
+deterministic counts confirm the mechanism, no timing claims), `pilot` (AB, k 1, 4x, a smaller
+size if the scenario has a knob — both sides run, and it gives the ETA its per-iteration time),
+`main` (ABBAABBA, k 8, 4x and 1x), `ctl` (ABBA, alternating 0 / 10 ms of injected cost per unit
+of work inside each session). `more` (one more ABBA block of main) is optional: it runs only when
+named. Put a second size or a negative control (`cfg` that switches the mechanism off) after `ctl`.
+Every pass has a `role` (`counts`, `trial`, `timing`, `control`); only timing passes carry a
+verdict. Run them as two background plans (sandbox off, `run_in_background: true`):
 
 ```bash
-cat ~/.claude/skills/suite-perf-ab/assets/harness-core.js \
-    ~/.claude/skills/suite-perf-ab/assets/adapters/suite-web.js
+node <skill>/rig/plan.mjs --run=<id> --only=counts,pilot      # ~2 min: read the counts and the logs
+node <skill>/rig/plan.mjs --run=<id>                          # ~25 min: every other non-optional pass
 ```
 
-`harness-core.js` is app-agnostic instrumentation and scenario primitives. `adapters/suite-web.js`
-supplies the Suite knowledge: fixtures, seeding, selectors, and the concrete scenarios built on the
-primitives. Profiling a different surface means writing a new adapter, not touching the core.
+**Performance cores** (macOS on Apple silicon, on by default): every measured iteration of a
+timing, control or trial pass waits until performance cores are free and the renderer's main
+thread runs on one at full clock; a session that cannot get there (cores busy for 15 min, a
+demoted renderer, a low clock) fails with the reason instead of measuring. An iteration is
+discarded and retried with fresh data only when another program's load (under 1 performance core
+free) or a demotion of the thread (`taskpolicy -b`, App Nap, a hidden window) pushed its work onto
+efficiency cores; the log line says which. A busy machine mostly makes the plan wait
+(`pcore-wait`), but contention shorter than ~100 ms goes unseen, so a quiet machine still gives the
+cleanest data. Efficiency-core time with performance cores free is macOS's own placement of light
+1x work: it is kept and reported per side as `pcore.eSharePct` in every table, and the advice and
+the report flag sides that differ by 5 points or more — read a 1x time difference next to that
+flag (measurements: references/rig.md).
 
-It has to be `initScript`, not `evaluate_script`, for two reasons that both fail silently:
+The second plan skips the finished counts and pilot sessions. Draft the result right after it:
+aggregate, report, narrative. Run `--only=more` (its sessions pool into main as `main-5-A` …,
+then re-aggregate) only when the aggregate's advice says more sessions could change a verdict.
+Sessions are resumable (re-run the command) and logged per session in `out/`; each plan ends with
+the aggregate. Prefer 4x for CPU totals (after idle the first ~30 ms of work runs 2.5-3x slower on
+Apple silicon, which compresses 1x deltas; the rig's warm-up spins counter most of it).
 
-- `window.Playwright` must be true before `MainWeb`'s effect runs, or `window.store` never appears.
-- The React DevTools hook must exist before `react-dom`'s module body evaluates, because that is
-  when React looks for it. Install it late and every commit count reads zero.
+### 6. Read the result
 
-What the core gives you, all passively:
+`aggregate.mjs` prints the headline metrics per pass and rate: pooled p50/p75 with min–max, Δ of
+the session medians, the session medians themselves and the verdict (`B lower` / `B higher` /
+`overlap`, permutation p). Then any other metric whose sessions separate (p ≤ 0.1, |Δ| ≥ 5%).
+Last the advice: per timing pass and rate, each timing headline metric is called, underpowered
+(these session counts cannot reach p ≤ 0.1: 2 v 2 at best 0.333), borderline (p ≤ 0.25) or
+settled; the control is landed, inconclusive, underpowered (raise ctl k) or failed (every session
+missed 70–110% the same way). `next:` lines say what one more block could call (with its
+estimate and command), that the draft is stable, or — only for a failed control — to fix the rig
+before adding sessions.
+Before believing a delta:
 
-| Signal | From | Sees |
-| --- | --- | --- |
-| React commits, timestamps | fake `__REACT_DEVTOOLS_GLOBAL_HOOK__` | every commit; safe because production react-dom calls the hook inside `try/catch` |
-| Fibers committed, newly mounted | opt-in fiber walk | how *big* a commit was, not just how many |
-| Long tasks, TBT | `PerformanceObserver('longtask')` | main-thread work over 50ms |
-| Script time, forced style/layout | `PerformanceObserver('long-animation-frame')` | per-script duration and Chrome's own forced-reflow accounting |
-| Interaction latency | `PerformanceObserver('event')` | input responsiveness — read the caveat in `pitfalls.md` about synthetic events |
-| Layout shift | `PerformanceObserver('layout-shift')` | content jumping during an interaction |
-| Frame intervals | `requestAnimationFrame` deltas | the only signal below the observers' 50ms floor |
-| Heap trend | memory sampler | growth across repeated cycles |
+- **Controls**: the injected cost landed (roughly 70-110% of what was injected; at 1x a lighter
+  build can read lower). If it did not, the metric cannot see this workload.
+- **Env per side**: markers as expected, `coverageFiles` 0, React renderers 1, calibration 4x ≈ 4×
+  1x, the canary ≈ 1, and the performance-core line (waits, discards, E share, P clock).
+- **Window length**: when one side's phase lasts much longer (a drain), compare `taskCorrMs`
+  (idle-corrected) and the counts, not raw totals or percentiles over the window.
+- A delta with no mechanism in the diff gets attributed before it is reported: `--profile-at=3` on
+  one session per side, then `attr.mjs` (source-mapped self/inclusive time). CDP thread time says
+  how much, the profile says where — they can disagree on promise-heavy code (IndexedDB).
 
-Do not monkey-patch `getBoundingClientRect` or the layout getters to count reads during a timing
-run. It works, but it taxes whichever branch reads layout more — usually the one you are judging.
-Counting in a dedicated non-timing run is fine; say which run a count came from.
+### 7. Report
 
-## 5. Scenario primitives
+Write `<run>/narrative.json` (template in `rig/templates/`): verdict cards, findings, root cause
+sections, caveats. Then `node <skill>/rig/report.mjs --run=<id>`, load the `artifact-design`
+skill, and publish `report.html` with the Artifact tool. Habits that make it trustworthy:
 
-The core implements seven shapes. An adapter supplies `{setup, act, reset}` for each; the shape
-decides what is isolated.
-
-| Primitive | Isolates | Use when the diff touched |
-| --- | --- | --- |
-| `mount` | first render of a subtree | list rendering, a new component, data volume |
-| `update` | re-render with mounting already paid | memoization, selectors, store shape |
-| `interact` | responsiveness of a handler | event handlers, input paths |
-| `scroll` | per-frame work | virtualization, scroll handlers, CSS containment |
-| `navigate` | teardown plus build of a route | routing, effect cleanup |
-| `cycle` | retention across repeated mount/unmount | effects, observers, caches, listeners |
-| `boot` | cold load, bundle parse, hydration | imports, code splitting, dependencies |
-
-Two traps worth knowing before you write a scenario:
-
-- **One dispatch, not many.** Suite reads the store through `useSyncExternalStore`, so a store change
-  from outside React renders synchronously, once per dispatch. Sixty individual `createAccount`
-  dispatches produce ~39 commits and measure a list being built incrementally. Use a bulk action.
-- **Scale the data.** Run size-sensitive scenarios at two sizes (60 and 200 accounts works). Flat
-  versus linear in collection size is the most convincing result available and it needs two points.
-
-## 6. The measurement protocol
-
-Same numbers on both branches, always:
-
-| Knob | Value | Why |
-| --- | --- | --- |
-| Iterations | 15, first 3 discarded | JIT and styled-components warm up; iteration 0 runs 20–30% slower |
-| Statistic | p75, nearest rank | Report p50/p75/min/max so the reader sees the spread |
-| CPU | 1x and 4x (`emulate`) | 1x on Apple silicon at 120Hz floors frame time at 8.3ms and hides real regressions |
-| Sizes | two, for anything size-sensitive | Separates "faster" from "no longer scales" |
-| Cycles | ≥20 for `cycle` | A heap slope needs a run; two readings prove nothing |
-
-State what the p75 is **over**: repeated iterations within one page session, not independent page
-loads. It captures variance in the interaction, not in app startup. Report iteration 0 separately
-when the cold case matters.
-
-Traces are a *supplement*, not the source of headline numbers. Record at most one short trace per
-branch per scenario, for the scripting / style / paint split, and label it with its real n.
-`references/pitfalls.md` explains why; the short version is that tracing this workload writes
-~200MB in 1.2s, saturates the thread it is measuring, truncates its own buffer, and its overhead
-scales with React commit count — so it penalises whichever branch commits more, which is not the
-same branch in every scenario.
-
-## 7. Analyse
-
-Zero-dependency Node, all in `scripts/`:
-
-```bash
-# p75 over in-page iteration records — the headline numbers
-node scripts/p75.js --label="develop mount 4x" --warmup=3 <records.json> --out=<summary.json>
-
-# slice a trace into the windows the harness marked, then p75 each metric
-node scripts/iter-report.js --scenario=S1 --label="develop mount" --warmup=0 <trace.json>
-
-# one trace, full DevTools category breakdown (also --aggregate and --compare)
-node scripts/analyze-trace.js <trace.json> [--from=<ms>] [--to=<ms>] [--json]
-```
-
-Save each `evaluate_script` result straight to a file with its `filePath` argument — the records are
-long and you will want them again. Delete trace files as soon as you have their summary; they are
-~200MB each and a full run makes six.
-
-**When a result surprises you, verify it before reporting.** A regression found with one gesture
-should be reproduced with a different one — a slow drag as well as a fast flick. One extra run is
-cheap; a retracted finding is not. For a suspected leak, confirm with `take_heapsnapshot` before
-calling it a leak.
-
-## 8. Report
-
-Publish as an artifact, structured so a reviewer can act:
-
-- **Verdict cards** — one per scenario, headline delta, direction obvious at a glance.
-- **A table per scenario** — develop, branch, delta, with n and throttling stated.
-- **Root cause for any regression** — commit counts and fiber counts usually name the mechanism.
-  Follow with concrete ordered fixes referencing real props and files, and **cite the house rule each
-  fix comes from** (`references/house-rules.md` maps findings to rules). Suite already has a named,
-  worked answer for most of what this harness finds; inventing generic advice next to an existing
-  rule competes with it. Where no rule covers the finding, say that explicitly rather than dressing
-  an opinion up as policy.
-- **The traced category split** — scripting vs style/layout vs paint, flagged with its small n.
-- **Coverage** — which of the six classes you measured, and which suspects you raised but could not
-  reach. An unmeasured class is not a passed one.
-- **Caveats** — synthetic state, what p75 is over, trace overhead, one machine.
-
-Two habits that make a report trustworthy:
-
-- **Check the PR's stated motivation separately from its result.** A PR can be a real win for a
-  reason other than the one it claims. If the claimed mechanism does not show up, say so and say
-  what the win actually came from — that is useful review feedback, not criticism. When the change
-  the numbers did not credit is one a house rule *requires*, say that too: "mandated by
-  `performance-dom` regardless; this call site was not where the cost was" is accurate, whereas
-  leaving it at "the motivation does not show up" reads as an argument against following the rule.
 - **Lead with the regression if there is one.** The author already knows about the win.
+- **Check the stated motivation separately from the result.** If the claimed mechanism does not
+  show up, say what the win actually came from. When the change the numbers did not credit is one
+  a house rule requires, say that too ("mandated by `performance-dom` regardless").
+- **Root cause and fixes cite the house rule** (`references/house-rules.md`); where no rule covers
+  it, say so instead of dressing an opinion up as policy.
+- **Coverage**: which of the six problem classes were measured, which suspects could not be reached.
+- **Caveats**: synthetic vs emulator state, sessions and k, the base SHA, the machine and its load,
+  web and desktop numbers are never compared with each other.
 
-## Adapting to another surface or app
+### 8. Clean up
 
-Write a new file in `assets/adapters/`. An adapter exports an object with the state seeding, the
-selectors that find the elements a scenario drives, and the concrete scenarios built from the core
-primitives. `adapters/suite-web.js` is the worked example; the contract it implements is documented
-at the top of `harness-core.js`.
+`node <skill>/rig/cleanup.mjs` lists clones (big), runs (small) and desktop profile dirs. Keep the
+run folder (report, summary, sessions); drop clones you will not reuse. If `tenv.mjs up` started
+the emulator, `tenv.mjs down`.
+
+## Deployed previews instead of local builds
+
+A side can be `"url": "https://dev.suite.sldev.cz/suite-web/<branch>/web/"` instead of a `rev` (no
+build). Only if both sides are previews, both are production builds of the same workflow, and
+`env.coverageFiles` reads 0 on both: PR previews come from the e2e workflow with Istanbul on,
+develop's usually not, which manufactures a regression on the branch. Pin the baseline: develop
+redeploys on every push, and a merge mid-run collapses every delta toward zero.
+`references/pitfalls.md` has the details. Local builds avoid all of it.
 
 ## Bundled files
 
 | File | Read it when |
 | --- | --- |
-| `references/problem-classes.md` | Phase 2 — turning a diff into suspects, and phase 8 checking coverage |
-| `references/house-rules.md` | Phase 2 scanning the diff for rule violations, and phase 8 citing the fix |
-| `references/seeding.md` | Setting up state; extending fixtures to other slices |
-| `references/pitfalls.md` | Any number looks wrong, or before trusting a trace, an INP figure or a leak |
-| `assets/harness-core.js` | Every run; also the adapter contract |
-| `assets/adapters/suite-web.js` | Every Suite run; the template for a new adapter |
-| `scripts/p75.js` | Aggregating in-page iteration records |
-| `scripts/iter-report.js` | Slicing a trace into marked windows |
-| `scripts/analyze-trace.js` | Full category breakdown of one trace |
+| `references/rig.md` | Writing run.json / plan.json / a scenario; every script's flags; output and metric names |
+| `references/desktop.md` | Any desktop target: launch, isolation, IPC, routing, what differs from web |
+| `references/emulator.md` | `device: emulator`, the `trezor-emulator` MCP, real data |
+| `references/mcp.md` | Exploring a build with the Playwright / chrome-devtools(-electron) MCPs, traces, heap snapshots |
+| `references/problem-classes.md` | Step 2 (diff → suspects) and checking coverage in the report |
+| `references/house-rules.md` | Step 2 rule scan, and citing the fix in the report |
+| `references/seeding.md` | Store seeding: the `@storage/load` payload, gates, account shape |
+| `references/pitfalls.md` | Any number that looks wrong; before trusting a trace, an INP figure or a leak |
+| `rig/templates/` | Start of every run: run.json, plan.json, scenario.mjs, page.js, narrative.json |
+| `examples/` | Worked scenarios (see step 4) |
+| `scripts/analyze-trace.mjs` | Category breakdown of a DevTools trace (MCP traces included) |
+| `assets/` | The older DevTools-MCP-only harness (`harness-core.js` primitives: mount/update/interact/scroll/navigate/cycle/boot) — ideas for scenario shapes; not for timing |

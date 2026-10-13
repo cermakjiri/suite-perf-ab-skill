@@ -1,0 +1,13 @@
+{
+ "id": "pr12345-<short-name>",
+ "title": "PR #12345 — <what the change does>",
+ "pr": "https://github.com/trezor/trezor-suite/pull/12345",
+ "target": "web",
+ "device": "synthetic",
+ "scenario": "scenario/scenario.mjs",
+ "cfg": {},
+ "sides": {
+  "A": { "label": "develop (merge-base)", "rev": "<merge-base sha>", "markers": { "<string only the PR adds>": 0 } },
+  "B": { "label": "PR head", "rev": "<PR head sha>", "markers": { "<string only the PR adds>": 1 } }
+ }
+}

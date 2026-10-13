@@ -1,17 +1,16 @@
 #!/usr/bin/env node
-'use strict';
 
 /**
- * analyze-trace.js - hard numbers out of raw Chrome DevTools performance traces.
+ * analyze-trace.mjs - hard numbers out of raw Chrome DevTools performance traces.
  *
  * Input: the JSON written by chrome-devtools-mcp `performance_stop_trace --filePath`
  * (or DevTools "Save profile..."). Accepts `{"traceEvents":[...], ...}` or a bare
  * array, plain `.json` or gzipped `.json.gz`. Zero npm dependencies.
  *
  * Usage
- *   node analyze-trace.js <trace-file...> [--json] [--from=<ms>] [--to=<ms>] [--label=<name>]
- *   node analyze-trace.js --aggregate [--p=75] <trace-file...>
- *   node analyze-trace.js --compare '<a-glob>' '<b-glob>' [--p=75]
+ *   node analyze-trace.mjs <trace-file...> [--json] [--from=<ms>] [--to=<ms>] [--label=<name>]
+ *   node analyze-trace.mjs --aggregate [--p=75] <trace-file...>
+ *   node analyze-trace.mjs --compare '<a-glob>' '<b-glob>' [--p=75]
  *
  * ---------------------------------------------------------------------------
  * METHOD (read this before trusting a number)
@@ -118,9 +117,9 @@
  *    Traces missing a metric contribute nothing to it (n shrinks) rather than 0.
  */
 
-const fs = require('fs');
-const path = require('path');
-const zlib = require('zlib');
+import fs from 'node:fs';
+import path from 'node:path';
+import zlib from 'node:zlib';
 
 // ---------------------------------------------------------------------------
 // Category tables (mirrors devtools-frontend EventStyles, trimmed to what we sum)
@@ -1139,12 +1138,12 @@ const expand = pattern => {
 // CLI
 // ---------------------------------------------------------------------------
 
-const USAGE = `analyze-trace.js - hard numbers out of raw Chrome DevTools traces (no npm deps)
+const USAGE = `analyze-trace.mjs - hard numbers out of raw Chrome DevTools traces (no npm deps)
 
-  node analyze-trace.js <trace-file...> [--json] [--from=<ms>] [--to=<ms>] [--label=<name>]
+  node analyze-trace.mjs <trace-file...> [--json] [--from=<ms>] [--to=<ms>] [--label=<name>]
                                         [--top=<n>] [--names=<n>]
-  node analyze-trace.js --aggregate [--p=75] [--json] <trace-file...>
-  node analyze-trace.js --compare '<a-glob>' '<b-glob>' [--p=75] [--json]
+  node analyze-trace.mjs --aggregate [--p=75] [--json] <trace-file...>
+  node analyze-trace.mjs --compare '<a-glob>' '<b-glob>' [--p=75] [--json]
 
   --from/--to   window in ms, relative to navigationStart (or first trace event)
   --p           percentile for --aggregate/--compare (nearest-rank, default 75)

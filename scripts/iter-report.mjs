@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * Slice a Chrome trace into the per-iteration windows the harness marked, run analyze-trace.js on
+ * Slice a Chrome trace into the per-iteration windows the harness marked, run analyze-trace.mjs on
  * each, and report the percentile across iterations.
  *
- *   node iter-report.js --scenario=S1 --label="develop mount" [--warmup=0] [--p=75] trace.json
+ *   node iter-report.mjs --scenario=S1 --label="develop mount" [--warmup=0] [--p=75] trace.json
  *                       [--out=summary.json]
  *
  * The harness's `s1`/`s2`/`s3` runners emit `performance.measure('S<n>-<i>', ...)` around each
@@ -12,10 +12,10 @@
  * If it prints "no S*-* measures found", the trace buffer truncated before your iterations ran —
  * see references/pitfalls.md. Shrink the traced scenario rather than trusting a partial result.
  */
-const fs = require('fs');
-const zlib = require('zlib');
-const path = require('path');
-const { execFileSync } = require('child_process');
+import fs from 'node:fs';
+import zlib from 'node:zlib';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 const args = process.argv.slice(2);
 const opt = (name, dflt) => {
@@ -28,10 +28,10 @@ const scenario = opt('scenario', 'S1');
 const label = opt('label', files[0] ? path.basename(files[0]) : '?');
 const warmup = Number(opt('warmup', 0));
 const pct = Number(opt('p', 75));
-const ANALYZER = path.join(__dirname, 'analyze-trace.js');
+const ANALYZER = path.join(import.meta.dirname, 'analyze-trace.mjs');
 
 if (!files.length) {
-    console.error('usage: node iter-report.js --scenario=S1 [--label=NAME] [--warmup=0] [--p=75] trace.json');
+    console.error('usage: node iter-report.mjs --scenario=S1 [--label=NAME] [--warmup=0] [--p=75] trace.json');
     process.exit(1);
 }
 
@@ -44,7 +44,7 @@ const readTrace = f => {
 };
 
 /**
- * Must match analyze-trace.js exactly: navigationStart when present, otherwise the earliest event
+ * Must match analyze-trace.mjs exactly: navigationStart when present, otherwise the earliest event
  * with ts > 0, skipping metadata ('M') events. Get this wrong and every window lands in empty
  * space — the tell-tale is all-zero metrics with a correct windowDurationMs.
  */

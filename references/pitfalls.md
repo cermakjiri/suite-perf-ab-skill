@@ -4,6 +4,148 @@ Every entry here was hit for real or verified by direct measurement in Chrome. M
 — they produce plausible numbers rather than an error — which is why they are worth knowing before
 you trust a result.
 
+## The builds and the rig
+
+These fail before a single metric is collected, and everything downstream still looks normal.
+
+### The branch preview is coverage-instrumented; develop's usually is not
+
+Both previews are production builds from the same webpack config on the same host, which is exactly
+why this is easy to miss. They are not built by the same workflow:
+
+| Writes to | Workflow | Trigger | `INSTRUMENT_CODE` | Istanbul |
+| --- | --- | --- | --- | --- |
+| `suite-web/<branch>/web` | `test-suite-web-desktop-e2e-pr.yml` → `build-suite-web-e2e.yml` | every PR | `"false"` | **on** |
+| `suite-web/develop/web` | `build-suite-web.yml` | push to develop | unset | off |
+| `suite-web/develop/web` | `test-suite-web-desktop-e2e-nightly.yml` | cron Mon–Fri 00:00 | `"true"` | **on** |
+| `suite-web/develop/web` | `test-suite-web-desktop-e2e-canary.yml` | cron Sun 01:00 | `"false"` | **on** |
+
+The first row is not a typo. `packages/suite/webpack/createBaseConfig.ts` (formerly `packages/suite-build/configs/base.webpack.config.ts`) gates the plugin
+on `process.env.INSTRUMENT_CODE ? [...] : []`, and the string `"false"` is truthy in Node — so the
+input whose name and default say "off" turns instrumentation **on**. Every PR preview is
+instrumented. Only the workflow that sets no env var at all produces a clean build, and that
+workflow only ever builds `develop`.
+
+The develop preview is whatever the **last** of its three writers left behind, so its state changes
+through the week: instrumented after a weekday nightly, clean again after the next push to develop.
+Which means the asymmetry is real but not constant — it has to be measured per run, not assumed.
+
+Measured 2026-09-14, scanning every deployed chunk for `__coverage__` / `cov_<hash>`:
+
+| Preview | Chunks | Instrumented |
+| --- | --- | --- |
+| `fix/low-fee-warning` (PR) | 227 | **35** (3,700 markers) |
+| `develop` | 219 | 0 |
+
+Istanbul's `include` is `packages/*/src/**` and `suite-common/*/src/**` — application code only.
+So the counters land on exactly the code a PR changes, the tax is asymmetric in the branch's
+disfavour, and the run manufactures a regression that does not exist in the source. Sampling the
+biggest chunks does **not** find it: the three largest on both sides are vendor and near-identical
+in size (615,473 vs 615,925 bytes).
+
+Check at runtime, per build, once the app has booted:
+
+```js
+Object.keys(globalThis.__coverage__ ?? {}).length   // 0 = clean, anything else = instrumented
+```
+
+Instrumented modules create and populate that global as they initialise, so a booted app shows it
+immediately. Offline equivalent — note it must walk every chunk, not a sample:
+
+```bash
+B=https://dev.suite.sldev.cz/suite-web/<branch>/web
+M=$(curl -sL "$B/" | grep -oE 'js/main\.[a-f0-9]+\.js' | head -1)
+curl -s "$B/$M" | grep -oE '[0-9]+:"[a-f0-9]{8}"' | tr -d '"' |
+  while IFS=: read id h; do
+    curl -s "$B/js/$id.$h.js" | grep -q '__coverage__' && { echo "INSTRUMENTED (chunk $id)"; break; }
+  done
+```
+
+If the two sides disagree, the deployed pair is not comparable and no number of extra iterations
+fixes it. Two honest ways out:
+
+1. Report only what does not depend on the timings — the diff reading, the suspect list, the
+   coverage gaps — and say plainly why the numbers are missing.
+2. Build both revisions locally with the same command and `INSTRUMENT_CODE` unset, and compare that
+   pair. Symmetric-but-local beats asymmetric-but-deployed. Never mix one deployed side with one
+   local side.
+
+Do not try to subtract the instrumentation out. Its cost is per executed statement in changed code,
+which is the very thing being measured.
+
+### The develop baseline moves, and merging the PR erases the comparison
+
+`develop` redeploys on every push, and the upload is `aws s3 sync --delete` — the build you
+baselined against is not retained anywhere once it is replaced. Two consequences:
+
+- A run spanning a develop push compares against two different bases without saying so.
+- If the PR **merges** mid-session, the develop preview rebuilds with the PR's own code in it. Every
+  delta collapses toward zero and the report reads "no regression" — the exact failure this skill
+  exists to prevent, arriving through the back door.
+
+Record the baseline identity at session start and read it again at the end, most to least reliable:
+
+```bash
+git rev-parse origin/develop origin/<branch>           # what you intend to compare
+curl -s  <base>/js/main.<hash>.js | grep -oE '[0-9.]+\.web\.[0-9a-f]{40}'   # SENTRY_RELEASE.id
+curl -sI <base>/js/main.<hash>.js | grep -iE 'last-modified|etag'
+```
+
+`window.SENTRY_RELEASE.id` is `<version>.web.<40-hex sha>` and resolves directly against the
+checkout — on 2026-09-14 the develop preview reported `26.10.0.web.d0d87f04…`, exactly
+`origin/develop` at that moment. It exists **only on the develop preview**: the Sentry webpack
+plugin is gated on `!isDev && sentryAuthToken`, and only `build-suite-web.yml` has
+`SENTRY_AUTH_TOKEN`. A PR preview never carries it, so for the branch side the fingerprint is
+`git rev-parse origin/<branch>` plus the content-hashed `main.<hash>.js` filename and
+`last-modified`/`etag`.
+
+The same gate produces a third asymmetry worth knowing: the Sentry plugin uploads source maps and
+deletes them, so `*.js.map` is **404 on develop and 200 on every PR preview** (verified on both).
+Nothing about runtime performance changes, but symbolication works on one side of the pair and not
+the other.
+
+Keep the numbers already taken, label every table with the base SHA it was measured against, and
+never merge pre- and post-merge base numbers into one row. Re-baselining means getting a preview
+built from the pre-merge SHA — which, coming from a branch build, would be coverage-instrumented
+while the develop build it replaces was not, so it is not a drop-in substitute for the base you lost.
+
+### CPU throttling that silently did not apply
+
+`emulate_cpu` returning success says the call was accepted, not that the renderer slowed down. The
+rate is set per target, so a new page or target quietly runs at 1x, and a "4x pass" that is really a
+second 1x pass yields a tidy, plausible, meaningless table — usually one showing less difference
+than the 1x pass, which is the direction that gets believed.
+
+Measure the ratio rather than trusting the call:
+
+```js
+(() => { let x = 0; const t0 = performance.now();
+  for (let i = 0; i < 5e7; i++) x += i % 7;
+  return { ms: performance.now() - t0, x };
+})()
+```
+
+Return `x` so the loop is not optimised away, and size the count so the 1x reading is 50–200ms — too
+short and the ratio is noise. Expect ≈4x under 4x throttling (3.5–4.5 in practice); near 1.0 means
+it never applied. Re-verify after switching branches, for the same reason the viewport does.
+
+### A metric that cannot move looks exactly like a metric that did not move
+
+Most of this file is ways a number comes back absent, floored, excluded or flat — INP from synthetic
+input, standard CLS during interactions, sub-50ms work under either long-task observer, rAF deltas
+below the frame budget, `performance.memory` under ~30MB. Every one of them reports "no change", and
+so does a PR that is genuinely safe. Nothing in the output distinguishes the two.
+
+So before an A/B is worth reporting, show the metric responds to the thing you would attribute to
+the PR. The two data sizes the protocol already requires are the free version: if p75 at 200
+accounts does not sit clearly above p75 at 60, that metric is not sensing that scenario, and a null
+result from it is not evidence of no regression. For a scenario that is not size-sensitive, inject a
+known cost — a 20ms busy block inside `act` — confirm it lands, then remove it.
+
+Run the control on both builds. A probe that works on one and not the other — the React hook failing
+to install, an observer never firing — is itself the finding, and it invalidates the comparison
+rather than merely weakening it.
+
 ## Metrics that can be silently empty
 
 ### Interaction latency from synthetic input is not slow or noisy — it is absent
@@ -199,19 +341,19 @@ traces only for the scripting / style / paint split, labelled with their real n.
 ### The trace buffer truncates, silently
 
 Only the first ~1.2s of a heavy workload survives. Ask for 12 iterations inside one trace and you
-get 2, with no warning. Symptom: `iter-report.js` prints `no S*-* measures found`, or reports fewer
+get 2, with no warning. Symptom: `iter-report.mjs` prints `no S*-* measures found`, or reports fewer
 iterations than you ran. Shrink the traced scenario, and if a full iteration will not fit, say so
 and rely on the untraced metrics.
 
 ### Trace window alignment reads as zeros
 
-`analyze-trace.js` takes `--from`/`--to` relative to its own origin: `navigationStart` when present,
+`analyze-trace.mjs` takes `--from`/`--to` relative to its own origin: `navigationStart` when present,
 otherwise the earliest event with `ts > 0`, **skipping metadata (`ph: 'M'`) events**. Compute the
 origin differently and every window lands in empty space.
 
 Symptom: every metric is `0.0` but `windowDurationMs` is correct — the window is the right length in
 the wrong place. That combination is never a real "no work happened". Traces recorded mid-session
-have no `navigationStart`, so the fallback path is the normal one; `iter-report.js` already
+have no `navigationStart`, so the fallback path is the normal one; `iter-report.mjs` already
 implements the matching rule.
 
 ## Scenario construction
@@ -255,3 +397,72 @@ run is cheap; a retracted finding is not.
 - **Inline output.** Per-iteration records are long. Pass `filePath` to `evaluate_script`.
 - **Stale summaries.** If you fix a bug in an analysis script, re-derive every summary it produced —
   a summary written before the fix will sit there full of zeros.
+
+## Found with the Playwright rig (2026-09 → 2026-10)
+
+Each of these produced a clean-looking wrong answer at least once. The rig guards the ones it can;
+the rest are for reading results.
+
+### Measurement
+
+- **The DevTools MCP taxes array spreads ~25x.** Pages it attaches to run with the V8 Debugger
+  domain on: 10k `a = [...a, i]` takes ~650 ms instead of ~26 ms; `slice()+push` is untouched. A
+  PR that removes spreads looked 11x better through the MCP than in a debugger-free Chromium. The
+  runner's env canary (`spread`/`slice` ≈ 1) proves a session was debugger-free.
+- **Idle core ramp.** After ~300 ms of idle, the first ~30 ms of renderer work runs 2.5-3x slower
+  on Apple silicon. A 20 ms injected block moved a metric by 1.4 ms until the warm-up (two spins,
+  each its own task followed by a frame) went in front of every iteration. Prefer 4x for CPU
+  totals; at 1x a light build's savings read compressed.
+- **The session is the unit.** Same-build sessions differed 222 vs 157 ms p50 at 4x; a consistent
+  +10 ms per keystroke in 2 v 2 sessions was pure noise (profiles showed equal script time, and the
+  sign flipped at 4x). Pooled iteration statistics across builds are meaningless with 2 sessions.
+- **Controls must be paired inside a session.** Across processes, a +200 ms injection drowned in
+  ±300 ms of session spread at 4x. Alternating 0 / X ms inside one session (`--alt-inject`) landed
+  85-112% at 4x on both builds.
+- **Window-length confound.** When one side's window is minutes longer (an IndexedDB drain),
+  percentiles over the whole window flatter it (idle frames) and CPU totals overcharge it (probe
+  and background cost × time). Split the phases at the user-visible boundary and idle-correct the
+  long one (`idleCorrect`, `taskCorrMs`).
+- **CDP thread time and the V8 profile can disagree** on promise-heavy code: CDP filed a PR's
+  IndexedDB win under "other" (non-script) time and read +20% script; the source-mapped profile
+  showed the idb wrapper 220 → 35 ms. Totals from CDP, attribution from `attr.mjs`.
+- **Local builds run redux-logger** (`!isCodesignBuild()` in `packages/suite/src/reducers/store.ts`)
+  and the dashboard's recharts re-renders on every store change: equal on both sides, but they
+  inflate absolute numbers and keep logged states reachable (post-GC heap). Say so when quoting
+  absolute values.
+- **Motion baseline.** A frame's rAF timestamp can precede the input's `event.timeStamp` while
+  that frame already sees the post-input layout. Take a synchronous `getBoundingClientRect`
+  baseline when arming and compare `performance.now()` in callbacks, not `ts`.
+- **Infinite animations** (a spinner while fees never load offline) force style + layout every
+  frame on both sides; pause `document.getAnimations()` with `iterations === Infinity` before a window.
+
+### Seeding and the app
+
+- **The `@storage/load` payload must carry every slice the revision expects** (`supportedNetworks`,
+  `earnOnboarding`, `stellarContractTokens`, `language: 'en-US'` …). A missing key makes one
+  reducer throw inside a try/catch and the whole seed silently no-ops — Suite then never finishes
+  loading on either build. Re-check the payload keys against the revisions under test.
+- **Fresh data per iteration**: after a completed `fetchAllTransactionsForAccount`, the account
+  keeps `areAllTransactionsLoaded` (only `removeAccount` clears it); reloading it pages by 5 — a
+  different workload. Seed one target per iteration.
+- **Suite's browser detection rejects the `HeadlessChrome` UA** and **token definitions are a
+  plain fetch that hangs init** when stalled: the rig sets a normal UA and answers definitions.
+- Same transaction timestamps for every seeded account mean anything keyed by tx time sees a
+  constant-size map, not a growing one.
+
+### Builds and the environment
+
+- **zsh `time` + an env prefix silently builds a dev bundle** (the script's `NODE_ENV` is lost):
+  73 MB of JS instead of 21. `build.mjs` checks for a hashed `main.<hash>.js`.
+- **The desktop build never cleans its output**: stale chunks with other hashes mix two builds.
+  `build.mjs` runs `clean` first.
+- **Clones**: `clonefile` follows symlinks (CLAUDE.md arrives as a file; the forced checkout fixes
+  it); `git status` in a clone talks to the original's fsmonitor daemon until `core.fsmonitor` is
+  off; peers switch the main checkout's branch mid-run — never build in the shared tree. A built
+  clone holds ~1-2 GiB of real blocks: check disk (`preflight.mjs`).
+- **Agent tooling**: `chmod +x` prompts even in bypass mode; `rsync` is denied by a permission
+  rule (use `cp -R`); `ps`, the docker socket and local WebSockets are blocked inside the Bash
+  sandbox; Chromium and Electron need it off; foreground `sleep` is blocked — run plans in the
+  background and wait for the notification.
+- **Desktop**: references/desktop.md (IPC sender validation, the init-script race, thunks that
+  are not exported, higher idle CPU).
