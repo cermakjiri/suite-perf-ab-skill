@@ -26,18 +26,32 @@
  * gets main-thread task/script/layout/style time next to the in-page probe stats.
  *
  * Progress: a JSON snapshot (--progress, default <out dir>/progress/<session>.json) of the stage
- * (emulator, launch, seed, checks, calibrate, idle, warm-up, pcore-wait, ready, measure, profile,
- * done | failed | interrupted), rate, iteration, phase and the wall time of every finished iteration; the same
- * timing lands in the record as meta.timing for later estimates.
+ * (queued, emulator, launch, seed, checks, calibrate, idle, warm-up, pcore-wait, ready, measure,
+ * profile, done | failed | interrupted), rate, iteration, phase and the wall time of every finished
+ * iteration; the same timing lands in the record as meta.timing for later estimates.
+ *
+ * Parallel runs (rig/locks.mjs): a session first takes the machine slot — one page session or build
+ * step per machine, whichever run it belongs to (stage `queued` while another holds it; --slot=off
+ * skips it) — and, with device=emulator, the emulator before that. It registers as a user of the
+ * clone it serves, so no other run can --rebuild it underneath.
+ *
+ * Which build ran, without a marker: every bundle inlines its commit (COMMITHASH and the release
+ * string). The env check scans the loaded modules for this side's commit (build.mjs's buildSha / sha)
+ * and every other side's: another side's commit, or a release string naming another commit, fails
+ * the session; neither found yet (the module not loaded) leaves it to the build's offline fingerprint
+ * (env.build.verified = 'offline'). A deployed preview (side.url) records the commit it served,
+ * which aggregate.mjs uses to refuse pooling sessions from two deployments. run.json `markers` are
+ * optional extra proof that a given piece of code is in the bundle.
  *
  * Run with the Bash sandbox off (Chromium/Electron cannot start inside it).
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { RIG, parseArgs, numbers, loadRun, sideOf, resolveIn, repoRoot, readJson, writeJson, writeJsonSafe, log, loadavg, sleep, dur, importScenario, roleResolver, SESSION_FILE, SPARES, passArgv } from './lib.mjs';
+import { RIG, parseArgs, numbers, loadRun, sideOf, resolveIn, repoRoot, readJson, writeJson, writeJsonSafe, log, loadavg, sleep, dur, importScenario, roleResolver, SESSION_FILE, SPARES, passArgv, PROFILES } from './lib.mjs';
 import { launch } from './launch.mjs';
 import { Pcore } from './pcore.mjs';
+import { acquire, holderText, slotOff, cloneOf, useClone } from './locks.mjs';
 
 const T0 = Date.now();
 const args = parseArgs();
@@ -61,7 +75,14 @@ const IDLE_MS = Number(args.idleMs ?? scenario.idleMs ?? 10000);
 const PHASE_TIMEOUT = Number(args.phaseTimeoutMs ?? 600000);
 const phases = (scenario.phases || []).map(p => (typeof p === 'string' ? { name: p } : p));
 if (!phases.length) throw new Error(`${scenarioFile}: scenario.phases is empty`);
+const RUN_ID = run.id || path.basename(run.dir);
 const markerNeedles = Object.keys(side.markers || {});
+// the automatic proof: the commit this side's bundle carries (build.mjs), and every other side's
+const commitOf = s => (s && (s.buildSha || s.sha)) || null;
+const OWN = commitOf(side);
+const FOREIGN = [...new Set(Object.entries(run.sides).filter(([k]) => k !== side.key).map(([, s]) => commitOf(s)).filter(c => c && c !== OWN))];
+const needles = [...new Set([...markerNeedles, ...(OWN ? [OWN] : []), ...FOREIGN])];
+const short = s => (s ? String(s).slice(0, 10) : '–');
 // the pass's role (plan.mjs passes it; by hand it is read from the run's plan.json and the out file name)
 const ROLE = args.role || (() => {
     let passes = [];
@@ -133,13 +154,17 @@ for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
         if (!process.listenerCount(sig)) process.exit(code);
     });
 }
-// meta.timing: what plan.mjs and later estimates learn from (overhead = everything but iterations)
+// meta.timing: what plan.mjs and later estimates learn from (overhead = everything but iterations and
+// the wait for the machine slot, which depends on other runs)
+let QUEUE_MS = 0;
 const timing = () => {
     const durationMs = Date.now() - T0;
     const iterTotal = Object.values(P.iterMs).flat().reduce((s, x) => s + x, 0);
 
-    return { startedAt: P.startedAt, durationMs, overheadMs: durationMs - iterTotal, iterMs: P.iterMs };
+    return { startedAt: P.startedAt, durationMs, queueMs: QUEUE_MS, overheadMs: durationMs - QUEUE_MS - iterTotal, iterMs: P.iterMs };
 };
+// a lock wait as the progress snapshot's `queued` stage
+const queued = (lock, what) => w => progress({ stage: 'queued', queue: { lock, what, holder: holderText(w.holder), ahead: w.ahead, since: new Date(Date.now() - w.waitedMs).toISOString() } });
 
 const pageFile = path.resolve(path.dirname(scenarioFile), scenario.page || 'page.js');
 const initScript = [
@@ -172,10 +197,32 @@ const diffMetrics = (a, b) => {
     };
 };
 
+// emulator.prepare: false = use whatever is on the bridge (a prepared emulator, a physical device)
+const USES_EMULATOR = device === 'emulator' && !(run.emulator && run.emulator.prepare === false);
+
+/** The locks a session holds (rig/locks.mjs), then the session itself. */
 const main = async () => {
+    const held = [];
+    const t0 = Date.now();
+    const who = { kind: 'session', run: RUN_ID, label: `${SESSION} (${side.key})`, role: ROLE };
+    try {
+        // no other run may --rebuild the clone this session serves — from the moment it is queued
+        held.push({ release: useClone(cloneOf(target === 'desktop' ? side.desktop : side.web), who) });
+        // the emulator before the machine: nobody holds the machine while waiting for the emulator
+        if (USES_EMULATOR) held.push(await acquire('emulator', who, { onWait: queued('emulator') }));
+        if (!slotOff(args.slot)) held.push(await acquire('machine', who, { onWait: queued('machine') }));
+        QUEUE_MS = Date.now() - t0;
+        if (QUEUE_MS >= 1000) sideLog(`waited ${dur(QUEUE_MS)} for the ${USES_EMULATOR ? 'emulator and the machine' : 'machine'}`);
+        progress({ queueMs: QUEUE_MS });
+        await session();
+    } finally {
+        for (const h of held.reverse()) h.release();
+    }
+};
+
+const session = async () => {
     const started = new Date().toISOString();
-    // emulator.prepare: false = use whatever is on the bridge (a prepared emulator, a physical device)
-    if (device === 'emulator' && !(run.emulator && run.emulator.prepare === false)) {
+    if (USES_EMULATOR) {
         progress({ stage: 'emulator' });
         const tenv = await import('./tenv.mjs');
         sideLog('emulator', JSON.stringify(await tenv.prepare(run.emulator || {})));
@@ -193,8 +240,8 @@ const main = async () => {
     const ev = (fn, arg) => page.evaluate(fn, arg);
     const out = {
         meta: {
-            run: run.id || path.basename(run.dir), side: side.key, label: side.label, rev: side.rev, sha: side.sha, variant: side.variant || null,
-            build: target === 'desktop' ? side.desktop : side.web || side.url, target, device, network,
+            run: RUN_ID, side: side.key, label: side.label, rev: side.rev, sha: side.sha, buildSha: OWN, variant: side.variant || null, profile: side.profile || null,
+            build: target === 'desktop' ? side.desktop : side.web || side.url, target, device, network, slot: slotOff(args.slot) ? 'off' : 'machine',
             scenario: scenario.name, cfg, k: K, rates: RATES, warmup: WARMUP, idleMs: IDLE_MS, altInject: ALT_INJECT, started,
             // the pass arguments, so plan.mjs can tell a finished session of another configuration from this one
             argv: passArgv(process.argv.slice(2)),
@@ -240,11 +287,21 @@ const main = async () => {
         await ev(() => window.__H.settle(1000));
 
         progress({ stage: 'checks' });
-        out.env = await ev(n => Object.assign(window.__H.env(n), { verify: window.__A.verify ? window.__A.verify() : null }), markerNeedles);
+        out.env = await ev(n => Object.assign(window.__H.env(n), { verify: window.__A.verify ? window.__A.verify() : null }), needles);
         out.env.desktopLaunches = L.launches ? L.launches() : null;
-        sideLog('env', JSON.stringify(Object.assign({}, out.env, { verify: undefined, support: undefined })));
+        sideLog('env', JSON.stringify(Object.assign({}, out.env, { verify: undefined, support: undefined, build: undefined })));
         if (out.env.coverageFiles !== 0 && !args.allowCoverage) fail(`build is coverage-instrumented (${out.env.coverageFiles} files) — not comparable; rebuild without INSTRUMENT_CODE`);
         if (!out.env.hook || out.env.renderers < 1) fail('React hook did not install before react-dom (commit counts would read 0)');
+        // which build ran: this side's commit in the loaded modules, and no other side's
+        const b = out.env.build || {};
+        const foreign = FOREIGN.filter(c => out.env.markers[c] > 0 || b.commit === c);
+        if (foreign.length) fail(`side ${side.key}: the running bundle carries the commit of ${foreign.map(c => `side ${Object.keys(run.sides).find(k => commitOf(run.sides[k]) === c)} (${short(c)})`).join(', ')} — wrong build`);
+        if (OWN && b.commit && b.commit !== OWN) fail(`side ${side.key}: the running bundle was built from ${short(b.commit)}, this side is ${short(OWN)} — a stale or wrong build`);
+        const verified = !OWN ? null : out.env.markers[OWN] > 0 || b.commit === OWN ? true : 'offline';
+        out.env.build = Object.assign({}, b, { expected: OWN, verified });
+        const codesign = side.profile && PROFILES[side.profile] ? PROFILES[side.profile].codesign : null;
+        if (codesign !== null && b.release && b.release.codesign !== codesign) fail(`side ${side.key}: the running bundle is ${b.release.codesign ? '' : 'not '}a codesign build, its ${side.profile} profile says otherwise — a stale build`);
+        sideLog(`build ${b.commit ? short(b.commit) : 'commit not seen'}${b.release ? ` (${b.release.version}.${b.release.suiteType}${b.release.codesign ? '.codesign' : ''})` : ''} · ${verified === true ? "this side's commit ✓" : verified === 'offline' ? 'not in a loaded module yet: the build fingerprint vouches for it' : 'recorded (no expected commit: a deployed preview)'} · compiler output in ${b.sentinelModules ?? '–'} of ${b.modules ?? '–'} loaded modules`);
         for (const [needle, want] of Object.entries(side.markers || {})) {
             if (out.env.markers[needle] !== want) fail(`side ${side.key}: marker ${JSON.stringify(needle)} found in ${out.env.markers[needle]} modules, expected ${want} — wrong build?`);
         }

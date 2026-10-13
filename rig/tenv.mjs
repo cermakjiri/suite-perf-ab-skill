@@ -11,6 +11,8 @@
  * The repo's compose files use network_mode: host, which Docker Desktop on macOS lacks, so ports are
  * published one by one. The emulator MCP (`trezor-emulator`, SSE on :9003) is served by the same
  * container; it connects only if the container was up when the Claude session started.
+ * One emulator serves the whole machine: run.mjs and open.mjs hold the `emulator` lock (rig/locks.mjs)
+ * while they use it, and `down` / `prepare` refuse while someone else holds it (--force overrides).
  * Run OUTSIDE the Bash sandbox: the docker socket and local WebSockets are denied inside it.
  */
 import fs from 'node:fs';
@@ -237,8 +239,16 @@ if (import.meta.main) {
         let r;
         if (cmd === 'up') r = await up({ regtest: !!a.regtest, repo, pull: !!a.pull });
         else if (cmd === 'status') r = await status();
-        else if (cmd === 'down') r = await down();
-        else if (cmd === 'prepare') r = await prepare({ model: a.model, fw: a.fw, mnemonic: a.mnemonic, passphrase: !!a.passphrase, label: a.label });
+        else if (cmd === 'down' || cmd === 'prepare') {
+            // the emulator is shared by every run on this machine: a session or exploration holding it is using it
+            const { queue, holderText } = await import('./locks.mjs');
+            const busy = queue('emulator').filter(t => t.pid !== process.pid);
+            if (busy.length && !a.force) {
+                console.error(`the emulator is in use: ${busy.map(holderText).join('; ')} — ${cmd === 'down' ? 'stopping it would break that session' : 'preparing wipes it under that session'} (--force to do it anyway)`);
+                process.exit(1);
+            }
+            r = cmd === 'down' ? await down() : await prepare({ model: a.model, fw: a.fw, mnemonic: a.mnemonic, passphrase: !!a.passphrase, label: a.label });
+        }
         else if (['yes', 'no', 'screen', 'features', 'stop'].includes(cmd)) {
             const c = await controller();
             const type = { yes: 'emulator-press-yes', no: 'emulator-press-no', screen: 'emulator-get-screen-content', features: 'emulator-get-features', stop: 'emulator-stop' }[cmd];

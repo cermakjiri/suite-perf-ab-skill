@@ -5,11 +5,17 @@ Suite desktop app. Measured and verified on 2026-10-13 (Electron 43.2.0, Playwri
 
 ## Build
 
-`build.mjs --targets=desktop` runs, in the side's clone, `yarn workspace @suite/desktop-app clean`
-(removes `build-electron/`, `build/`, `dist/` — the desktop build never cleans on its own, and
-stale chunks with other hashes would mix two builds), `build:ui` (renderer, ~33 s) and `build:app`
-(main + preload with `NODE_ENV=production`, ~19 s). The result is `<clone>/suite/desktop-app` with
-`dist/app.js` and `build/index.html`.
+`build.mjs --targets=desktop` runs, in the side's clone, the prep CI does for desktop
+(message-system config, app assets, `@trezor/transport-bridge build:lib` — the renderer copies the
+bridge UI from it), then `yarn workspace @suite/desktop-app clean` (removes `build-electron/`,
+`build/`, `dist/` — the desktop build never cleans on its own, and stale chunks with other hashes
+would mix two builds), `build:ui` (renderer, ~33 s) and `build:app` (main + preload with
+`NODE_ENV=production`, ~19 s), in the run's profile (`release`: `IS_CODESIGN_BUILD=true` — also hides
+the DevTools menu and drops "Dev" from the app name; the rig attaches over CDP either way). The
+result is `<clone>/suite/desktop-app` with `dist/app.js` and `build/index.html`. Its fingerprint
+reads the renderer (`build/js`) and the main process (`dist/`): both must carry the clone's commit
+(main only inside its release string); React Compiler coverage is counted in the renderer
+(`references/builds.md`).
 
 ## Launch (rig/launch.mjs)
 
@@ -41,8 +47,8 @@ its window first:
   **relaunches** (up to 3×) and records `env.desktopLaunches`. It never reloads: a renderer reload
   re-runs main's per-renderer IPC registration and can leave the app without a store for good
   (the "Attempted to register a second handler" race the QA harness hit on 6 of 14 reloads).
-- Exploration sessions (`open.mjs`, fixed `--remote-debugging-port=9222`): the window wins every
-  time. The probes are injected after boot instead (`probesLate`) — everything works except React
+- Exploration sessions (`open.mjs`, a fixed `--remote-debugging-port`, 9222 or the next free one):
+  the window wins every time. The probes are injected after boot instead (`probesLate`) — everything works except React
   commit counts. Fine for MCP work, which is never timing-grade anyway.
 
 ## What is different from web
@@ -72,3 +78,6 @@ fails and plan.mjs retries it once). A desktop session costs ~1 GB RAM.
 http://127.0.0.1:9222`) lists the Electron page and runs `evaluate_script`, traces and heap
 snapshots on it; the `playwright` MCP (`--cdp-endpoint`) snapshots and drives it. See
 references/mcp.md.
+
+A desktop session holds the machine slot like a web one (`references/builds.md`): a desktop plan and
+another run's web plan interleave, one session at a time.

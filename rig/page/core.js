@@ -303,8 +303,38 @@
             return null;
         }
     };
+    // <version>.<web|desktop>[.codesign].<sha>: the release string every build inlines (process.env.SENTRY_RELEASE)
+    const RELEASE = /(\d+\.\d+\.\d+)\.(web|desktop)(\.codesign)?\.([0-9a-f]{40})(?![0-9a-f])/;
+    /**
+     * One pass over the loaded modules' sources: how many carry each needle, the build's release
+     * string (its commit, version, codesign flag) and how many hold React Compiler output
+     * (`react.memo_cache_sentinel`; React defines it in one module itself). Only modules of chunks
+     * loaded so far are seen.
+     */
+    const scanModules = needles => {
+        const r = wr();
+        const counts = Object.fromEntries((needles || []).map(n => [n, 0]));
+        if (!r) return { counts, build: null };
+        let release = null;
+        let modules = 0;
+        let sentinelModules = 0;
+        for (const id of Object.keys(r.m)) {
+            const s = src(id);
+            modules += 1;
+            for (const n of needles || []) if (s.includes(n)) counts[n] += 1;
+            if (!release) {
+                const m = s.match(RELEASE);
+                if (m) release = { version: m[1], suiteType: m[2], codesign: !!m[3], commit: m[4] };
+            }
+            if (s.includes('react.memo_cache_sentinel')) sentinelModules += 1;
+        }
+
+        return { counts, build: Object.assign({ commit: release ? release.commit : null, release, modules, sentinelModules }) };
+    };
     /** How many modules carry each needle — proves which build is running. */
-    const markers = needles => Object.fromEntries((needles || []).map(n => [n, findModules(n).length]));
+    const markers = needles => scanModules(needles).counts;
+    /** The running build: release string, commit, modules loaded, modules with compiler output. */
+    const buildInfo = () => scanModules([]).build;
     /**
      * An RTK thunk from the production bundle by its type prefix. Modules already executed at boot
      * are returned from the cache, so requiring them has no side effects.
@@ -458,7 +488,7 @@
         CFG,
         sleep, nextFrame, settle, spin, waitFor, round, pct,
         RUN: window.__RUN || {},
-        wr, exportsOf, findModules, findThunk, markers, store, connect, state, dispatch, click, goto, routeName, suiteReady,
+        wr, exportsOf, findModules, findThunk, markers, buildInfo, store, connect, state, dispatch, click, goto, routeName, suiteReady,
         warm, injectCost,
         probes: { start: startProbes, stop: stopProbes, stats: windowStats },
         commits: () => P.commits.length,
@@ -588,6 +618,9 @@
                 return a.length;
             };
 
+            // needles: the scenario's markers and every side's commit (the runner's automatic proof)
+            const scan = scanModules(needles);
+
             return {
                 coverageFiles: Object.keys(globalThis.__coverage__ || {}).length,
                 hook: P.installed,
@@ -606,7 +639,8 @@
                 webpack: !!wr(),
                 // ratio ~1: no debugger attached; ~25: a DevTools debugger is on and spreads are taxed
                 canary: { spread: time(spread, 3), slice: time(slice, 3) },
-                markers: markers(needles),
+                markers: scan.counts,
+                build: scan.build,
                 domNodes: document.getElementsByTagName('*').length,
             };
         },

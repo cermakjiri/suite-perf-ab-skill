@@ -24,6 +24,13 @@
  * pass's args (its own merged over them) and continues its session numbers (main-5-A …), so
  * aggregate pools its sessions into that pass.
  *
+ * Builds: a session made from another commit than its side's current build (re-pinned or rebuilt
+ * since) is stale and runs again. A deployed preview (side.url) that serves another commit than the
+ * side's earlier sessions (develop redeployed mid-run) stops the plan: those numbers cannot pool.
+ *
+ * Parallel runs: every session waits for the machine slot (rig/locks.mjs) — sessions of several runs
+ * interleave, one at a time — and the wait shows as stage `queued`; --slot=off goes to every session.
+ *
  * Progress, in the log and in out/plan-status.json (written atomically): the estimate up front, a
  * line per session start and end, and a heartbeat every --heartbeat seconds and on every stage or
  * rate change of the running session (read from its out/progress/<session>.json), each with the
@@ -36,7 +43,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { RIG, parseArgs, list, numbers, loadRun, resolveIn, importScenario, readJson, writeJsonSafe, tryJson, exists, home, log, loadavg, sleep, dur, clock, alive, progressText, timingHistory, etaModel, estText, roleResolver, planSessions, cfgKey, SPARES, passArgv } from './lib.mjs';
+import { RIG, parseArgs, list, numbers, loadRun, resolveIn, importScenario, readJson, writeJsonSafe, tryJson, exists, home, log, loadavg, sleep, dur, clock, alive, progressText, timingHistory, etaModel, estText, roleResolver, planSessions, cfgKey, SPARES, passArgv, sideCommit, sessionCommit, SESSION_FILE } from './lib.mjs';
+import { queue, holderText } from './locks.mjs';
 
 const args = parseArgs();
 const run = loadRun(args.run);
@@ -50,7 +58,7 @@ const MAX_WAIT_S = Number(args.maxWaitS ?? 900);
 const RETRIES = Number(args.retries ?? 1);
 const HEARTBEAT_MS = Number(args.heartbeat ?? 30) * 1000;
 // the performance-core gate's flags go to every session as they are
-const PCORE_FLAGS = ['pcore', 'pcoreFree', 'pcoreMaxWaitS', 'maxEcoreMs', 'maxEcorePct', 'pcoreRetries']
+const PCORE_FLAGS = ['pcore', 'pcoreFree', 'pcoreMaxWaitS', 'maxEcoreMs', 'maxEcorePct', 'pcoreRetries', 'slot']
     .filter(k => args[k] !== undefined).map(k => `--${k.replace(/[A-Z]/g, c => '-' + c.toLowerCase())}=${args[k]}`);
 // more free performance cores than the machine has would only time out: refuse before any session runs
 const nP = ((tryJson(path.join(home(), 'machine.json')) || {}).pIndices || []).length;
@@ -108,6 +116,10 @@ const state = s => {
         if (d.complete !== true) return 'todo';
         const m = d.meta;
         if (m.spares !== SPARES) return 'stale';
+        // built from another commit than the side's current build (re-pinned or rebuilt since)
+        const want = sideCommit(run.sides[s.side]);
+        const got = sessionCommit(d);
+        if (want && got && got !== want) return 'stale';
         if (!m.argv) return m.k === s.shape.k && JSON.stringify(m.rates) === JSON.stringify(s.shape.rates) && m.warmup === s.shape.warmup && cfgKey(m.cfg) === cfgKey(s.shape.cfg) ? 'done' : 'stale';
 
         return JSON.stringify(passArgv(m.argv)) === JSON.stringify(passArgv(s.args)) ? 'done' : 'stale';
@@ -125,6 +137,22 @@ for (const p of passes.filter(x => selected(x) && x.extends)) {
         process.exit(2);
     }
 }
+
+/** For a deployed-preview side: the session just finished served another commit than the side's earlier ones. */
+const previewMoved = s => {
+    const side = run.sides[s.side];
+    if (!side || !side.url || sideCommit(side)) return null;
+    const mine = sessionCommit(tryJson(s.out));
+    if (!mine) return null;
+    for (const f of fs.readdirSync(OUT).filter(x => SESSION_FILE.test(x) && x !== path.basename(s.out))) {
+        const m = f.match(SESSION_FILE);
+        const d = m[3] === s.side ? tryJson(path.join(OUT, f)) : null;
+        const c = d && d.complete === true ? sessionCommit(d) : null;
+        if (c && c !== mine) return `side ${s.side} (${side.url}) served ${mine.slice(0, 10)}, its earlier session ${f.slice(0, -5)} ${c.slice(0, 10)}`;
+    }
+
+    return null;
+};
 
 let child = null;
 const runSession = s => new Promise(resolve => {
@@ -195,6 +223,8 @@ const main = async () => {
     const est = eta();
     const estimate = !todo.length ? '' : est ? ` · est ${estText(est, true)}, ≈ ${clock(Date.now() + est.ms)}` : ' · ETA after the first session';
     log(`plan ${path.basename(planFile)} · to run: ${perPass || 'nothing'} · ${skipped} done (skipped)${estimate}${optional.length ? ` · optional, not run: ${optional.map(p => p.name).join(', ')}` : ''}`);
+    const others = queue('machine').filter(t => t.run !== (run.id || path.basename(run.dir)));
+    if (others.length && todo.length) log(`machine: ${holderText(others[0])}${others.length > 1 ? ` and ${others.length - 1} more waiting` : ''} — this plan's sessions queue behind them and interleave (one session or build step at a time per machine)`);
     if (args.dry) {
         for (const s of sessions) log(state(s).padEnd(5), s.id, s.args.join(' '));
         if (model.empty) {
@@ -263,7 +293,9 @@ const main = async () => {
                 beat = now;
             }
             key = k;
-            const left = model.leftEst(s.shape, p, running.t0);
+            // a session queued for the machine has not started: its clock starts when it gets it
+            const queuedMs = p ? (p.stage === 'queued' && p.queue && p.queue.since ? Date.now() - Date.parse(p.queue.since) : p.queueMs || 0) : 0;
+            const left = model.leftEst(s.shape, p, running.t0 + queuedMs);
             status.current = Object.assign({}, p, { id: s.id, pass: s.pass, side: s.side, attempt: e.attempt, startedAt: e.startedAt, estMs: e.estMs, estRough: e.estRough, leftMs: left && left.ms, log: s.log });
             saveStatus();
         };
@@ -299,6 +331,18 @@ const main = async () => {
             Object.assign(e, { durationMs: ms, exit: code, endedAt: new Date().toISOString(), iterations: iters, discards: (e.discards || 0) + (fin.discards || 0), gateWaitMs: (e.gateWaitMs || 0) + (fin.gateWaitMs || 0) });
             status.discards = status.sessions.reduce((t, x) => t + (x.discards || 0), 0);
             status.gateWaitMs = status.sessions.reduce((t, x) => t + (x.gateWaitMs || 0), 0);
+            // a deployed preview serving another commit than this side's earlier sessions: develop redeployed
+            const moved = code === 0 ? previewMoved(s) : null;
+            if (moved) {
+                log(`   ${s.id}: ${moved} — stopping the plan: sessions from two deployments cannot pool (aggregate refuses them). Keep one deployment's sessions (move the others out of out/), or pin local builds`);
+                Object.assign(e, { state: 'failed', durationMs: Date.now() - t0, exit: code, endedAt: new Date().toISOString() });
+                status.totals.failed += 1;
+                status.failed.push(s.id);
+                status.state = 'failed';
+                status.error = moved;
+                saveStatus();
+                process.exit(1);
+            }
             if (code === 0) {
                 e.state = 'done';
                 status.totals.done += 1;

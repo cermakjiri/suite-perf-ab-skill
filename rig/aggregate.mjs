@@ -3,8 +3,16 @@
  * table per pass and CPU rate.
  *
  *   node aggregate.mjs --run=<name|dir> [--passes=main,ctl] [--print=main] [--warmup=<n>] [--all]
+ *        [--allow-mixed-builds]
  *
  * --passes limits what is summarized (default: every pass in out/), --print only what is printed.
+ *
+ * Builds first: every session records the commit its bundle carried (env.build, from the inlined
+ * COMMITHASH / release string). A side whose sessions ran more than one commit — a deployed preview
+ * that redeployed mid-run, a side rebuilt from another revision between sessions — is refused (exit
+ * 2, no summary): those numbers describe two builds. --allow-mixed-builds pools them anyway, with a
+ * warning. summary.run.sides carries each side's commit, profile, fingerprint (React Compiler
+ * coverage) and summary.run.base the revision check (revs.mjs).
  *
  * The page session is the unit: iterations inside one session are correlated, so next to the
  * pooled p50/p75 of kept iterations every metric gets one median per session, a separation check
@@ -32,7 +40,8 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseArgs, list, loadRun, resolveIn, readJson, tryJson, writeJson, summarize, median, permutationP, separated, importScenario, dur, CALL_P, called, minP, LANDED_PCT, controlVerdict, controlText, isMs, roleResolver, countKeys, planSessions, timingHistory, etaModel } from './lib.mjs';
+import { parseArgs, list, loadRun, resolveIn, readJson, tryJson, writeJson, summarize, median, permutationP, separated, importScenario, dur, CALL_P, called, minP, LANDED_PCT, controlVerdict, controlText, isMs, roleResolver, countKeys, planSessions, timingHistory, etaModel, sideCommit, sessionCommit } from './lib.mjs';
+import { compilerText } from './fingerprint.mjs';
 
 const args = parseArgs();
 const run = loadRun(args.run);
@@ -117,12 +126,25 @@ const pct = (a, b) => (typeof a === 'number' && typeof b === 'number' && a !== 0
 const gated = [];
 const warnings = [];
 const GATED_ROLES = ['timing', 'control', 'trial'];
+const TARGET = run.target || 'web';
+// the revision check revs.mjs recorded, without its file lists
+const baseOf = b => (b ? { branch: b.branch, tip: b.tip, mergeBase: b.mergeBase, behind: b.behind, ahead: b.ahead, mode: b.mode || null, state: b.state || null, checkedAt: b.checkedAt, pr: b.pr || null, mergeRefLag: b.mergeRefLag ?? null, overlap: (b.overlap || []).length } : null);
 const summary = {
-    run: { id: run.id, title: run.title, pr: run.pr, target: run.target || 'web', device: run.device || 'synthetic', scenario: scenario.name || run.scenario, sides: Object.fromEntries(Object.entries(run.sides).map(([k, s]) => [k, { label: s.label, rev: s.rev, sha: s.sha, variant: s.variant || null }])) },
+    run: {
+        id: run.id, title: run.title, pr: run.pr, target: TARGET, device: run.device || 'synthetic', scenario: scenario.name || run.scenario,
+        profile: (run.build && run.build.profile) || null,
+        base: baseOf(run.base),
+        sides: Object.fromEntries(Object.entries(run.sides).map(([k, s]) => [k, {
+            label: s.label, rev: s.rev, sha: s.sha, buildSha: s.buildSha || null, variant: s.variant || null, url: s.url || null, profile: s.profile || null,
+            fingerprint: (s.fingerprint && s.fingerprint[TARGET]) || null, guide: s.guide || null, commit: null, commits: {},
+        }])),
+    },
     generated: new Date().toISOString(),
     headline: scenario.headline || null,
     passes: {},
 };
+// the commit every session ran, per side (all passes): one build per side, or no summary
+const ranOn = {};
 
 for (const passName of passes) {
     const sess = all.filter(s => s.pass === passName).sort((a, b) => a.n - b.n);
@@ -133,7 +155,9 @@ for (const passName of passes) {
         const d = readJson(path.join(OUT, s.file));
         if (!d.runs || !d.runs.length) continue;
         loaded.push(Object.assign({ d }, s));
-        (P.sessions[s.side] = P.sessions[s.side] || []).push({ id: s.file.replace(/\.json$/, ''), complete: !!d.complete, iterations: d.runs.length, started: d.meta.started, load: d.meta.host && d.meta.host.load, browser: d.meta.browser, env: d.env && { markers: d.env.markers, coverageFiles: d.env.coverageFiles, renderers: d.env.renderers, canary: d.env.canary, desktopLaunches: d.env.desktopLaunches }, calib: d.calib, idle: Object.fromEntries(Object.entries(d.idle || {}).map(([r, i]) => [r, { taskPerS: i.ms ? +(i.taskMs / (i.ms / 1000)).toFixed(1) : null, commits: i.commits }])), pcore: d.meta.pcore ? { enabled: d.meta.pcore.enabled, reason: d.meta.pcore.reason, waitMs: d.meta.pcore.gateWaitMs, discards: d.meta.pcore.discards.length, kept: d.meta.pcore.kept.length } : null, error: d.error || null });
+        const c = sessionCommit(d);
+        if (c) ((ranOn[s.side] ||= {})[c] ||= []).push(s.file.replace(/\.json$/, ''));
+        (P.sessions[s.side] = P.sessions[s.side] || []).push({ id: s.file.replace(/\.json$/, ''), complete: !!d.complete, iterations: d.runs.length, started: d.meta.started, load: d.meta.host && d.meta.host.load, browser: d.meta.browser, env: d.env && { markers: Object.fromEntries(Object.entries(d.env.markers || {}).filter(([n]) => !/^[0-9a-f]{40}$/.test(n))), coverageFiles: d.env.coverageFiles, renderers: d.env.renderers, canary: d.env.canary, desktopLaunches: d.env.desktopLaunches, build: d.env.build || null }, commit: sessionCommit(d), calib: d.calib, idle: Object.fromEntries(Object.entries(d.idle || {}).map(([r, i]) => [r, { taskPerS: i.ms ? +(i.taskMs / (i.ms / 1000)).toFixed(1) : null, commits: i.commits }])), pcore: d.meta.pcore ? { enabled: d.meta.pcore.enabled, reason: d.meta.pcore.reason, waitMs: d.meta.pcore.gateWaitMs, discards: d.meta.pcore.discards.length, kept: d.meta.pcore.kept.length } : null, error: d.error || null });
         if (!P.meta) P.meta = { k: d.meta.k, rates: d.meta.rates, warmup: d.meta.warmup, idleMs: d.meta.idleMs, cfg: d.meta.cfg, altInject: d.meta.altInject, target: d.meta.target, device: d.meta.device, scenario: d.meta.scenario };
     }
     P.role = roleOf(passName, P.meta);
@@ -214,6 +238,33 @@ for (const passName of passes) {
         P.rates[rate] = R;
     }
     summary.passes[passName] = P;
+}
+
+// ------------------------------------------------------------------ builds
+// one commit per side across every session, or the numbers describe two builds
+const mixed = [];
+for (const [k, side] of Object.entries(summary.run.sides)) {
+    const by = ranOn[k] || {};
+    side.commits = Object.fromEntries(Object.entries(by).map(([c, ids]) => [c, ids.length]));
+    const commits = Object.keys(by);
+    side.commit = commits.length === 1 ? commits[0] : null;
+    if (commits.length > 1) mixed.push(`side ${k}${side.url ? ` (${side.url})` : ''} ran ${commits.length} builds: ${commits.map(c => `${c.slice(0, 10)} in ${by[c].length} (${by[c].slice(0, 3).join(', ')}${by[c].length > 3 ? ', …' : ''})`).join('; ')}`);
+    const want = sideCommit(run.sides[k]);
+    if (commits.length === 1 && want && commits[0] !== want) warnings.push(`side ${k}'s sessions ran ${commits[0].slice(0, 10)}, but run.json now builds ${want.slice(0, 10)} — re-pinned or rebuilt since: plan.mjs reruns them`);
+}
+const sideCommits = Object.values(summary.run.sides).map(x => x.commit).filter(Boolean);
+if (sideCommits.length > 1 && new Set(sideCommits).size === 1) {
+    const profiles = new Set(Object.values(summary.run.sides).map(x => x.profile || '–'));
+    warnings.push(profiles.size > 1 ? `every side ran the same commit ${sideCommits[0].slice(0, 10)} in another build profile (${Object.entries(summary.run.sides).map(([k, x]) => `${k} ${x.profile}`).join(', ')}): a build-config comparison` : `every side ran the same commit ${sideCommits[0].slice(0, 10)}: an A/A comparison`);
+}
+if (mixed.length) {
+    const why = 'a side whose sessions ran more than one build cannot be pooled: a deployed preview that redeployed mid-run (develop on every push), or a side rebuilt between sessions';
+    if (!args.allowMixedBuilds) {
+        for (const m of mixed) console.error(`refused: ${m}`);
+        console.error(`${why}. Keep one build's sessions (move the others out of out/), or pool them anyway with --allow-mixed-builds (with a warning in the report).`);
+        process.exit(2);
+    }
+    warnings.push(...mixed.map(m => `mixed builds pooled (--allow-mixed-builds): ${m}`));
 }
 
 // ------------------------------------------------------------------ advice
@@ -404,4 +455,10 @@ for (const [side, g] of Object.entries(summary.pcore)) {
     const why = Object.entries(g.causes || {}).map(([c, n]) => `${n} ${c}`).join(', ');
     console.log(`pcore ${side}: ${g.gated || g.partly ? `${g.gated}/${g.sessions} sessions gated${partly} · waited ${dur(g.waitMs)} · ${g.discards} discarded${why ? ` (${why})` : ''}${g.timeouts ? ` · ${g.timeouts} gates not met` : ''}${perRate ? ` · ${perRate}` : ''}${(g.scopes || []).includes('process') ? ' · process scope: no main-thread share' : ''}` : 'off'}${g.off.length ? ` · off: ${g.off.join('; ')}` : ''}`);
 }
+for (const [k, side] of Object.entries(summary.run.sides)) {
+    const fp = side.fingerprint;
+    const c = side.commit || sideCommit(run.sides[k]);
+    console.log(`build ${k}: ${c ? c.slice(0, 10) : 'commit unknown'}${side.url ? ` (preview ${side.url})` : ''}${side.profile ? ` · ${side.profile}` : ''}${fp && fp.release ? ` · ${fp.release.version}.${fp.release.suiteType}${fp.release.codesign ? '.codesign' : ''}` : ''} · compiler: ${fp ? compilerText(fp.compiler, 4) : '–'}`);
+}
+if (summary.run.base && summary.run.base.behind) console.log(`base: B was ${summary.run.base.behind} commits behind origin/${summary.run.base.branch} when pinned, measured as ${summary.run.base.mode}`);
 console.log(`\nsummary: ${outFile}`);

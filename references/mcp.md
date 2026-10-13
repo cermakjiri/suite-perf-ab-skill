@@ -18,11 +18,15 @@ node <skill>/rig/open.mjs --run=<id> --side=B [--target=desktop] [--minutes=90] 
 ```
 
 It launches the side exactly like a timing session (same build, seed, mocks, route), with CDP on
-`127.0.0.1:9222`, prints `READY`, writes `$PERF_AB_HOME/open.json` and stays up until killed
-(`kill -TERM <pid from open.json>`), the minutes pass, or the window closes. In the page:
+`127.0.0.1:9222` (or the next free port when another exploration holds it — the MCPs as configured
+attach to 9222 only), prints `READY`, writes `<run>/open-<side>.json` (pid, port, URL) and stays up
+until killed (`kill -TERM <pid from open-<side>.json>`), the minutes pass, or the window closes. It
+registers as a user of the clone it serves (no other run can rebuild it underneath), holds the
+emulator while open with `device: emulator`, and never takes the machine slot: its CPU is load to
+another run's timing session, which the performance-core gate waits out or discards. In the page:
 `window.__H` (store, connect, findThunk, goto, runPhase, probes) and `window.__A` (the scenario).
-Web uses a persistent Chromium profile — the browser's default context, the only one CDP clients
-see. On desktop the window loads before the init script can be registered on a fixed port, so the
+Web uses a persistent Chromium profile (`profiles/<run>-web-<side>`) — the browser's default
+context, the only one CDP clients see. On desktop the window loads before the init script can be registered on a fixed port, so the
 probes are injected after boot (no React commit counts in that session).
 
 ## Facts that cost time when unknown
@@ -47,4 +51,5 @@ probes are injected after boot (no React commit counts in that session).
 - **Heap**: `take_heapsnapshot` on both sides after the same number of iterations, compare retained
   sizes of the suspect class; `performance.memory` alone is allocation history, not live data.
 - Port 9222 is shared machine-wide: a peer session's browser or a leftover `open.mjs` holds it
-  (`preflight.mjs` checks; `open.mjs` refuses to start on a taken port).
+  (`preflight.mjs` checks). `open.mjs` then takes the next free port and says so; `--port=9222`
+  refuses a taken port instead.

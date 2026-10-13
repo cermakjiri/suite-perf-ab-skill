@@ -4,10 +4,11 @@
  "pr": "https://github.com/trezor/trezor-suite/pull/12345",
  "target": "web",
  "device": "synthetic",
+ "build": { "profile": "release" },
  "scenario": "scenario/scenario.mjs",
  "cfg": {},
  "sides": {
-  "A": { "label": "develop (merge-base)", "rev": "<merge-base sha>", "markers": { "<string only the PR adds>": 0 } },
-  "B": { "label": "PR head", "rev": "<PR head sha>", "markers": { "<string only the PR adds>": 1 } }
+  "A": { "label": "develop", "rev": "<target branch sha: revs.mjs pins it>" },
+  "B": { "label": "PR head", "rev": "<PR head sha: revs.mjs pins it>" }
  }
 }

@@ -1,12 +1,16 @@
 ---
 name: suite-perf-ab
 description: >
-  Measure and compare runtime performance of a Trezor Suite branch or PR against develop, on web
-  and on the Electron desktop app, with a reusable Playwright rig: both revisions are built in
-  copy-on-write clones, every page session seeds identical wallet state (synthetic store state, or a
-  trezor-user-env emulator with real backends), the interaction is replayed at 4x and 1x CPU in ABBA
-  session order, and the report compares session medians with main-thread CPU, long tasks, frames,
-  input delay, React commits and memory, deltas in both directions. A run only writes its scenario.
+  Measure and compare runtime performance of a Trezor Suite branch or PR against its target branch
+  (develop), on web and on the Electron desktop app, with a reusable Playwright rig: it first checks
+  the branch is up to date with its target (and advises a rebase when it is not), builds both
+  revisions locally as release production builds in copy-on-write clones, proves from the commit
+  every bundle inlines which build each session ran, records React Compiler coverage per side, seeds
+  identical wallet state (synthetic store state, or a trezor-user-env emulator with real backends),
+  replays the interaction at 4x and 1x CPU in ABBA session order, and compares session medians of
+  main-thread CPU, long tasks, frames, input delay, React commits and memory, deltas in both
+  directions. Several runs can share a machine, one measured session at a time. A run only writes
+  its scenario.
   Use it whenever someone wants to benchmark, profile, or A/B a Suite branch or PR, verify or
   challenge a perf claim before approving or merging, ask whether a change made Suite (web or
   desktop) faster, slower, janky or leaky, check how a surface holds up with a large seeded wallet,
@@ -22,8 +26,9 @@ description: >
 
 # Suite performance A/B
 
-Measure a branch against `develop` and say, with numbers a reviewer can trust, what got faster,
-what got slower, and what did not move — on web, on desktop, or both.
+Measure a branch against its target branch (`develop`, or the `release/*` branch a backport
+targets) and say, with numbers a reviewer can trust, what got faster, what got slower, and what did
+not move — on web, on desktop, or both.
 
 Everything but the scenario is in `rig/` (reference: `references/rig.md`). A run writes two files
 — the scenario's Node part and its in-page part — and a run definition; building, launching,
@@ -32,8 +37,10 @@ seeding order, throttling, probes, sessions, statistics and the report are share
 
 ## What a good run produces
 
-- A build pair proven comparable: production builds of pinned SHAs made with the same command,
-  no coverage instrumentation, a code marker per side that proves which build ran.
+- A build pair proven comparable: the branch up to date with its target (or the gap accepted by the
+  user and stated), pinned SHAs built locally with CI's recipe in the same profile (release: what
+  users install), no coverage instrumentation, and every session's bundle carrying its own side's
+  commit — the proof of which build ran, with no marker to choose. React Compiler coverage per side.
 - One scenario per suspected problem class, isolating one interaction, with fresh data per iteration.
 - ≥4 page sessions per side in ABBA order at 4x and 1x CPU. **The session is the unit**: iterations
   inside one session are correlated (same-build sessions differ up to 2x at 4x), so a timing
@@ -47,8 +54,10 @@ seeding order, throttling, probes, sessions, statistics and the report are share
 
 | Step | Command (all `node <skill>/rig/…`) | Sandbox |
 | --- | --- | --- |
+| Pin target + feature branch, up-to-date check | `revs.mjs --run=<id> --pr=<n>` (or `--branch=<name>`) | on |
 | Check machine, checkout, builds | `preflight.mjs --run=<id>` | either |
-| Build both sides (clones, cached by SHA) | `build.mjs --run=<id> --targets=web[,desktop]` | on |
+| Build both sides (clones, cached by SHA + profile) | `build.mjs --run=<id> --targets=web[,desktop]` | on |
+| What a build is: commit, profile, compiler coverage | `fingerprint.mjs --run=<id>` | on |
 | Explore one side with the MCPs (CDP :9222) | `open.mjs --run=<id> --side=B [--target=desktop]` | **off**, background |
 | One page session | `run.mjs --run=<id> --side=A --out=<f>` | **off** |
 | The whole plan, ABBA, resumable | `plan.mjs --run=<id> [--only=counts,pilot]` | **off**, background |
@@ -66,10 +75,11 @@ The rig is ES modules (`.mjs`, scenarios included: `export default { … }`) wri
 Node LTS (24). Builds run yarn with the `.nvmrc` Node of the revision being built when nvm has it
 (else the running Node, with a warning), so both sides are built by the same Node.
 
-**Prompts**: ask for everything up front in one batch — the sandbox-off commands above, `git
-fetch`, and any network host the run needs (`dev.suite.sldev.cz` for deployed previews, the
-backends for `network: live`). Never `chmod +x` (it prompts even in bypass mode); run every script
-as `node <file>`.
+**Prompts**: ask for everything up front in one batch — the sandbox-off commands above and the
+network hosts the run needs: `github.com` and `api.github.com` (`revs.mjs` fetches and asks `gh`),
+`registry.yarnpkg.com` (a build installs packages the checkout's cache lacks), the backends for
+`network: live`. Never `chmod +x` (it prompts even in bypass mode); run every script as
+`node <file>`.
 
 **Wait in the background.** Start `build.mjs`, `plan.mjs`, `open.mjs`, `tenv.mjs up` and any step
 longer than about a minute with Bash `run_in_background: true`; the completion notification
@@ -78,33 +88,58 @@ polling (the last run lost 120 min to 29 such loops, 7 of them killed at the 10-
 After starting a step, tell the user in one line what runs, the estimate and finish time (the
 first line it prints) and the status command.
 
-**Progress.** `node <skill>/rig/status.mjs --run=<id>` answers at once, in ≤ 8 lines: what runs
+**Progress.** `node <skill>/rig/status.mjs --run=<id>` answers at once, in ≤ 9 lines: what runs
 (pass, session, stage, rate, iteration, phase), done / failed / to go, elapsed, ETA and finish
-time, the build if one is going, and whether the plan died or stalled. The background task's
-output has a heartbeat line with the stage and the ETA on every stage change and every 30 s. The
-user can run `status.mjs --watch` in their own terminal; never run `--watch` yourself.
+time, the build if one is going, who has the machine, and whether the plan died or stalled. The
+background task's output has a heartbeat line with the stage and the ETA on every stage change and
+every 30 s. The user can run `status.mjs --watch` in their own terminal; never run `--watch`
+yourself.
+
+**Parallel runs.** Several runs (agents, PRs, web and desktop of one PR) can share the machine, and
+the rig keeps them from measuring each other: every page session and every heavy build step takes
+the machine slot, one at a time across all runs, first come first served — a session waiting for it
+shows stage `queued` with who holds it. A clone is built by one run at a time and never rebuilt
+while a session serves it; the emulator is held by whoever uses it; `open.mjs` takes the next free
+CDP port. So starting a second run's build or plan is safe; it interleaves and takes longer. Tell
+the user when another run holds the machine (`preflight.mjs` and `status.mjs` say so). Details:
+`references/builds.md`.
 
 ## Workflow
 
-### 1. Preflight and pin the revisions
+### 1. Pin the revisions — and check the branch is up to date first
 
 ```bash
-git fetch origin pull/<n>/head                           # the PR head, by SHA from here on
-git merge-base origin/develop <pr-head-sha>              # side A: develop at the PR's base
-node <skill>/rig/preflight.mjs                           # load, disk, power, Playwright, port 9222
+node <skill>/rig/revs.mjs --run=<id> --pr=<n|url>              # or --branch=<name> [--base=develop]
+node <skill>/rig/preflight.mjs --run=<id>                      # machine, checkout, revisions, builds
 ```
 
-Side A is the merge-base, not today's develop: exactly the PR's commits apart. Create the run
-folder: `$PERF_AB_HOME/runs/<id>/` with `run.json` and `plan.json` copied from `rig/templates/`.
-Fill `sides.A/B.rev` with SHAs and give each side a **marker** — a string only the PR's code
-contains (a template literal, an action type, an error message the minifier keeps) with the module
-count expected (0 on A, ≥1 on B). The runner refuses a session whose bundle does not match.
+`revs.mjs` creates the run folder from `rig/templates/` when needed, takes the PR's **target
+branch** from GitHub (`develop`, or the `release/*` branch of a backport), fetches it and the PR
+head, and checks that the branch is **up to date** with it. Up to date: side A = the target's tip,
+side B = the head, exactly the branch's own commits apart; it writes both SHAs into `run.json`.
+
+**Behind** (exit 3): it prints what moved on the target (commits, files, the files both sides
+touched, a moved `yarn.lock`) and pins nothing. Do not pick a way around it yourself — ask the user,
+leading with the rebase:
+
+1. **Rebase first** (recommended): the branch's author rebases onto the target and pushes, then pin
+   again. As it stands the result can be inconclusive: against today's tip the PR is charged with
+   commits it does not contain; against its fork point it is measured on a base that no longer
+   exists.
+2. Measure the branch's own commits on its old base: `--accept-behind=merge-base` (the report
+   carries the caveat).
+3. Measure GitHub's merge of the PR into the target, as CI tests it: `--accept-behind=merge-ref`
+   (a PR that does not conflict).
+
+No marker to choose: every bundle inlines its commit, which proves which build each session ran
+(`references/builds.md`). `markers` in `run.json` stay optional, to prove a given piece of code is
+in the bundle (not tree-shaken, not behind a flag).
 
 ### 2. Turn the diff into suspects, then scenarios
 
-**Read code through a subagent.** An Explore subagent reads the diff (`git diff <merge-base>
-<pr-head>`: every changed source file in full, the surrounding file at both revisions where the
-diff alone does not say what the code did before) and the code path, and returns a brief: entry
+**Read code through a subagent.** An Explore subagent reads the diff between the pinned sides
+(`git diff <side A rev> <side B rev>` from `run.json`: every changed source file in full, the
+surrounding file at both revisions where the diff alone does not say what the code did before) and the code path, and returns a brief: entry
 points, thunks and selectors, testids and routes, the expected mechanism, what to seed. Keep only
 the brief in the main conversation; read a file directly only when you are about to edit it. The
 last run read 1.06M characters of code into the main conversation and compacted three times.
@@ -122,12 +157,18 @@ device: **synthetic** (seeded store, mocked backend: deterministic, the default)
 
 ### 3. Build both sides (in the background while you write the scenario)
 
-`node <skill>/rig/build.mjs --run=<id> --targets=web` (add `,desktop`). Per side: copy-on-write
-clone of the main checkout (~20 s), forced checkout of the SHA, optional `patch` (a variant: a
-reverted hunk, a tweaked constant), offline `yarn install --immutable --mode=skip-build` (~3 s),
-then the same build command on both sides (web ~35-60 s, desktop ~55 s) with no Sentry token and
-no `INSTRUMENT_CODE`. A cached SHA builds in 0 s. It writes the build paths into `run.json`, numbers
-its steps (`[A 3/4] web build … (last 0:52)`) and estimates them from earlier builds on this machine.
+`node <skill>/rig/build.mjs --run=<id> --targets=web` (add `,desktop`). Per side, CI's recipe in a
+copy-on-write clone of the main checkout (~20 s): forced checkout of the SHA (a `patch` variant is
+committed, so it gets a commit of its own), the inherited `.env.local` set aside, `yarn install`
+offline (~3 s; packages the checkout's cache lacks are fetched once and kept for later clones), the
+generated libs CI regenerates (message-system config, app assets, transport bridge; ~10 s), then the
+build (web ~35-65 s, desktop ~70 s; the React Compiler's babel pass makes a compiled side slower). **Profile** `release` by default (`IS_CODESIGN_BUILD=true`:
+what users install — no redux-logger, which costs every dispatch); `--profile=preview` (or
+`run.json` `build.profile`) builds what CI previews are. Every build is fingerprinted: its bundle
+must carry the clone's commit and the profile's flag, and its React Compiler coverage is recorded
+(`fingerprint.mjs`). A cached SHA + profile builds in 0 s. It writes the build paths, commits and
+fingerprints into `run.json`, numbers its steps (`[A 3/7] web build … (last 0:52)`) and estimates
+them from earlier builds on this machine. Why each step: `references/builds.md`.
 
 ### 4. Write the scenario
 
@@ -215,8 +256,9 @@ Before believing a delta:
 
 - **Controls**: the injected cost landed (roughly 70-110% of what was injected; at 1x a lighter
   build can read lower). If it did not, the metric cannot see this workload.
-- **Env per side**: markers as expected, `coverageFiles` 0, React renderers 1, calibration 4x ≈ 4×
-  1x, the canary ≈ 1, and the performance-core line (waits, discards, E share, P clock).
+- **Env per side**: the `build` line (this side's commit ✓, the profile), `coverageFiles` 0, React
+  renderers 1, calibration 4x ≈ 4× 1x, the canary ≈ 1, and the performance-core line (waits,
+  discards, E share, P clock). `aggregate.mjs` refuses a side whose sessions ran two builds.
 - **Window length**: when one side's phase lasts much longer (a drain), compare `taskCorrMs`
   (idle-corrected) and the counts, not raw totals or percentiles over the window.
 - A delta with no mechanism in the diff gets attributed before it is reported: `--profile-at=3` on
@@ -234,10 +276,12 @@ skill, and publish `report.html` with the Artifact tool. Habits that make it tru
   show up, say what the win actually came from. When the change the numbers did not credit is one
   a house rule requires, say that too ("mandated by `performance-dom` regardless").
 - **Root cause and fixes cite the house rule** (`references/house-rules.md`); where no rule covers
-  it, say so instead of dressing an opinion up as policy.
+  it, say so instead of dressing an opinion up as policy. Whether a memo is a fix or redundant
+  depends on whether that side compiled the file: read the fingerprint's React Compiler line.
 - **Coverage**: which of the six problem classes were measured, which suspects could not be reached.
 - **Caveats**: synthetic vs emulator state, sessions and k, the base SHA, the machine and its load,
-  web and desktop numbers are never compared with each other.
+  web and desktop numbers are never compared with each other. The report adds how the revisions were
+  pinned (up to date, or behind and how it was accepted) and the build profile on its own.
 
 ### 8. Clean up
 
@@ -245,20 +289,23 @@ skill, and publish `report.html` with the Artifact tool. Habits that make it tru
 run folder (report, summary, sessions); drop clones you will not reuse. If `tenv.mjs up` started
 the emulator, `tenv.mjs down`.
 
-## Deployed previews instead of local builds
+## Deployed previews (only when a local build is impossible)
 
-A side can be `"url": "https://dev.suite.sldev.cz/suite-web/<branch>/web/"` instead of a `rev` (no
-build). Only if both sides are previews, both are production builds of the same workflow, and
-`env.coverageFiles` reads 0 on both: PR previews come from the e2e workflow with Istanbul on,
-develop's usually not, which manufactures a regression on the branch. Pin the baseline: develop
-redeploys on every push, and a merge mid-run collapses every delta toward zero.
-`references/pitfalls.md` has the details. Local builds avoid all of it.
+Local builds are the method. A side can still be `"url":
+"https://dev.suite.sldev.cz/suite-web/<branch>/web/"` instead of a `rev`, only if both sides are
+previews of the same workflow and `env.coverageFiles` reads 0 on both: PR previews come from the e2e
+workflow with Istanbul on, develop's usually not, which manufactures a regression on the branch.
+Each session records the commit its preview served; `plan.mjs` stops when a side's deployment
+changes between sessions (develop redeploys on every push), and `aggregate.mjs` refuses to pool
+sessions from two deployments. Previews are `preview`-profile builds (redux-logger on).
+`references/pitfalls.md` has the details.
 
 ## Bundled files
 
 | File | Read it when |
 | --- | --- |
 | `references/rig.md` | Writing run.json / plan.json / a scenario; every script's flags; output and metric names |
+| `references/builds.md` | Why the pair is the target branch vs the branch, the rebase gate, the build recipe and profiles, the commit proof, React Compiler coverage, parallel runs, build-config changes weighed |
 | `references/desktop.md` | Any desktop target: launch, isolation, IPC, routing, what differs from web |
 | `references/emulator.md` | `device: emulator`, the `trezor-emulator` MCP, real data |
 | `references/mcp.md` | Exploring a build with the Playwright / chrome-devtools(-electron) MCPs, traces, heap snapshots |

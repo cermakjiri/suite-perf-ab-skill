@@ -3,7 +3,8 @@
 > **Status: alpha.** Shared for early testing. Expect rough edges, and please report what breaks.
 
 An [Agent Skill](https://agentskills.io) that measures **Trezor Suite** runtime performance — web
-and the Electron desktop app — on a branch or PR against `develop`, with a reusable Playwright rig.
+and the Electron desktop app — on a branch or PR against its target branch (`develop`), with a
+reusable Playwright rig.
 Each run writes only its scenario; building, launching, seeding, throttling, statistics and the
 report are shared.
 
@@ -14,8 +15,14 @@ It is tool-agnostic: the same folder works in **Claude Code** and in **GitHub Co
 
 - Reads the diff and works out which UI surfaces and problem classes are affected, instead of
   trusting the PR description.
-- Builds both revisions (merge-base and PR head) as production builds in copy-on-write clones,
-  cached by commit, and proves which build each session ran with a code marker.
+- Checks the branch is up to date with its target branch first, and advises a rebase when it is
+  not (a result against a moved base can be inconclusive).
+- Builds both revisions locally (the target's tip and the PR head) with CI's recipe as **release**
+  builds (`IS_CODESIGN_BUILD=true`: what users install — no redux-logger) in copy-on-write clones,
+  cached by commit and profile.
+- Proves which build each session ran from the commit every bundle inlines — no marker to choose —
+  and records **React Compiler coverage** per side (memo blocks per source area, from the source
+  maps).
 - Seeds both sides into an **identical wallet state**: synthetic store state with a mocked backend
   (default), or a **trezor-user-env emulator** with Suite's real connect, discovery and live
   backends for real data.
@@ -30,6 +37,8 @@ It is tool-agnostic: the same folder works in **Claude Code** and in **GitHub Co
   mostly costs waiting (contention under ~100 ms goes unseen: quieter is still cleaner). macOS's
   own placement of light work on efficiency cores is kept and reported per side.
 - Writes a self-contained HTML report — regressions first, both directions, attribution, caveats.
+- Lets several runs share one machine: measured sessions and heavy build steps take turns, one at a
+  time across all runs; clones, the emulator and the CDP port are guarded.
 - Optional: keeps one side open on CDP :9222 for the **Playwright MCP** and the
   **chrome-devtools(-electron) MCP** to explore, trace and heap-snapshot (never to time).
 
@@ -48,6 +57,7 @@ bundle sizes (that is `suite-bundle-ab`), or summarize what a branch changed.
 | Playwright Chromium (`yarn playwright install chromium`) | web sessions run headless |
 | clang (Xcode Command Line Tools) | builds the performance-core helper (`rig/native/pcore.c`) on first use; without it the gate is off |
 | Docker Desktop | only for `device: emulator` (trezor-user-env) |
+| `gh` and network access | `github.com` / `api.github.com` to pin a PR and its target branch; `registry.yarnpkg.com` when the target branch locks packages the checkout's yarn cache lacks |
 | MCP servers (optional) | `playwright` / `chrome-devtools-electron` attached to `127.0.0.1:9222`, `trezor-emulator` on `:9003` — see `references/mcp.md` |
 
 Runs and clones live in `$PERF_AB_HOME` (default `~/.local/share/suite-perf-ab`).
@@ -134,7 +144,8 @@ In Claude Code you can also invoke it explicitly:
 /suite-perf-ab perf/accounts-list
 ```
 
-The skill builds the PR head and its merge-base locally (no preview deployments needed), writes
+The skill checks the PR is up to date with its target branch (and asks you about a rebase when it
+is not), builds the target's tip and the PR head locally (no preview deployments needed), writes
 the scenario, runs the core checks (counts and a short pilot), then the timing plan in the
 background (~25 min for the default plan), drafts the report, and adds sessions only when they
 could change a verdict. Desktop: ask for it ("…on desktop too"). Real device and data: ask for the
@@ -160,9 +171,10 @@ and the method. The run folder keeps every session's raw JSON, so any number can
 | Path | What it is |
 | --- | --- |
 | `SKILL.md` | the workflow |
-| `rig/` | the reusable rig: `preflight`, `build`, `run` (one session), `plan` (ABBA, resumable, with heartbeats and an ETA), `status` (where a run stands, at once), `aggregate` (statistics and advice), `report`, `open` (MCP exploration), `tenv` (emulator), `attr` (profile attribution), `cleanup`; `page/core.js` (in-page probes and helpers); `templates/` |
+| `rig/` | the reusable rig: `revs` (pin the target and the branch, up-to-date check), `preflight`, `build`, `fingerprint` (commit, profile, React Compiler coverage of a build), `run` (one session), `plan` (ABBA, resumable, with heartbeats and an ETA), `status` (where a run stands, at once), `aggregate` (statistics and advice), `report`, `open` (MCP exploration), `tenv` (emulator), `attr` (profile attribution), `cleanup`, `locks` (parallel runs); `page/core.js` (in-page probes and helpers); `templates/` |
 | `examples/` | worked scenarios: `history-load` (web, store seed + mocked backend + real thunk), `account-switch` (web + desktop, trusted clicks), `emulator-accounts` (real device and data) |
 | `references/rig.md` | every script's flags, run.json / plan.json / scenario contract, outputs, metric names |
+| `references/builds.md` | the pair and the rebase gate, the build recipe and profiles, the commit proof, React Compiler coverage, parallel runs, build-config changes weighed |
 | `references/desktop.md`, `emulator.md`, `mcp.md` | the desktop target, trezor-user-env, exploring with the MCPs |
 | `references/problem-classes.md`, `house-rules.md` | diff → suspects → scenarios; fixes cited from Suite's own rules |
 | `references/seeding.md`, `pitfalls.md` | store seeding; every trap that produced a wrong answer once |
@@ -185,5 +197,7 @@ git -C ~/.claude/skills/suite-perf-ab pull
   scenarios drive the UI (`examples/account-switch`).
 - Emulator runs depend on live backends unless you use the regtest sidecar: compare CPU and counts,
   not wall times.
+- Parallel runs share one machine by taking turns: two plans at once each take about twice as long,
+  and their numbers stay clean. Every pinned commit × profile is a clone of ~1-2 GiB.
 - Found something wrong, or a scenario it should cover?
   [Open an issue](https://github.com/cermakjiri/suite-perf-ab-skill/issues).

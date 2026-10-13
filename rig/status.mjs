@@ -10,13 +10,15 @@
  *
  *   node status.mjs --run=<name|dir> [--json] [--watch[=<s>]]
  *
- * Reads run.json, out/plan-status.json, out/progress/<session>.json and build-status.json, prints
- * at most 8 lines and exits. --watch re-prints every <s> seconds (default 5) until the plan ends:
+ * Reads run.json, out/plan-status.json, out/progress/<session>.json, build-status.json and the
+ * machine slot's queue ($PERF_AB_HOME/locks/machine: which run's session or build has the machine,
+ * how many wait — other runs included), prints at most 9 lines and exits. --watch re-prints every <s> seconds (default 5) until the plan ends:
  * for your own terminal, never as an agent's foreground wait. Runs inside the sandbox.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs, loadRun, tryJson, exists, sleep, dur, clock, alive, progressText, estText, SESSION_FILE } from './lib.mjs';
+import { queue, holderText } from './locks.mjs';
 
 const args = parseArgs();
 const run = loadRun(args.run);
@@ -44,8 +46,11 @@ const snapshot = () => {
     const sessionFiles = exists(OUT) ? fs.readdirSync(OUT).filter(f => SESSION_FILE.test(f)) : [];
     const lastSessionAt = Math.max(0, ...sessionFiles.map(f => mtime(path.join(OUT, f)) || 0)) || null;
     const summaryAt = mtime(path.join(run.dir, 'summary.json'));
+    // the machine slot, all runs: holder first, then the waiting line
+    const q = queue('machine');
     const s = {
         run: run.id || path.basename(run.dir), at: iso(now), plan: null, current: null, last: null, latest: null, build: null, problems: [],
+        machine: q.length ? { holder: q[0], waiting: q.slice(1), mine: q.filter(t => t.run === (run.id || path.basename(run.dir))).length } : null,
         summary: { at: iso(summaryAt), lastSessionAt: iso(lastSessionAt), newer: summaryAt && lastSessionAt ? summaryAt >= lastSessionAt : null },
     };
     // a session writes its snapshot at least every 30 s while it lives: stuck = stale or its pid gone
@@ -150,9 +155,14 @@ const lines = s => {
             ? `build ${b.side} ${b.step.i}/${b.step.n} ${b.step.name} · ${dur(Date.now() - at(b.step.startedAt))}${b.step.estMs ? ` of ≈ ${dur(b.step.estMs)}` : ''}${b.etaMs !== null && b.etaMs !== undefined ? ` · build ETA ≈ ${clock(b.etaAt)}` : ''}`
             : `build ${b.state === 'running' ? 'stopped (pid gone)' : b.state}${b.updatedAt ? ` ${clock(b.updatedAt)}` : ''}${b.error ? `: ${b.error.split('\n')[0].slice(0, 120)}` : ''}`);
     }
+    const m = s.machine;
+    if (m && (m.waiting.length || m.holder.run !== s.run)) {
+        out.push(`machine ${holderText(m.holder)}${m.waiting.length ? ` · ${m.waiting.length} waiting (${m.waiting.slice(0, 3).map(t => `${t.label || t.kind}${t.run && t.run !== s.run ? ` of ${t.run}` : ''}`).join(', ')}${m.waiting.length > 3 ? ', …' : ''})` : ''}`);
+    }
+    if (b && b.waiting) out.push(`build waiting for ${b.waiting.lock === 'machine' ? 'the machine' : 'the clone'} · ${b.waiting.holder} · since ${clock(b.waiting.since)}`);
     for (const p of s.problems) out.push(`! ${p}`);
 
-    return out.slice(0, 8);
+    return out.slice(0, 9);
 };
 
 const print = s => console.log(args.json ? JSON.stringify(s, null, 1) : lines(s).join('\n'));

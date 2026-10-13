@@ -43,13 +43,21 @@ the rest of the codebase already solves that problem.
 
 ## Two rules that change what a *finding* means
 
-**Which app is compiled decides whether a memo is a fix or a defect.** `suite-native` runs React
-Compiler, so it auto-memoizes and manual memoization there is a regression risk — a bail-out silently
-drops auto-memoization for the whole component. `packages/suite` (web and desktop) is **not**
-compiled, so manual memoization is the only runtime mechanism. `suite-common/*` and
-`packages/components` ship to both and must be memoized for the web consumer. Since this harness
-measures web, "add a `useMemo`" is a legitimate recommendation here — but say so explicitly when the
-changed file also ships to native.
+**Whether a file is compiled decides whether a memo is a fix or a defect — check it per side, never
+assume it.** Where the React Compiler runs, it auto-memoizes: a manual `useMemo`/`useCallback`/`memo`
+is redundant at best, and a bail-out silently drops auto-memoization for the whole component. Where
+it does not run, manual memoization is the only runtime mechanism and "add a `useMemo`" is a
+legitimate recommendation. `suite-native` is compiled. Web and desktop are being rolled out: on
+develop (2026-10) `packages/suite` is not compiled, but PR #32496 compiles `suite-common` and
+`packages/suite/src/{views,components,hooks}` — and compiler rollouts are the A/Bs most likely to
+come, where A is uncompiled and B compiled.
+
+So read each side's fingerprint (`fingerprint.mjs`, preflight, the report's side cards): its React
+Compiler line counts the memo blocks per source area (`packages/suite/src/views 322 files …`), next
+to the `REACT_COMPILER_PATHS` that revision configures. Judge a memoization finding against the side
+it was measured on: a missing memo in an uncompiled file is a finding, the same "missing" memo in a
+compiled file is not. `suite-common/*` and `packages/components` ship to native too; say so when a
+recommendation touches them.
 
 **A redundant memo is flagged as often as a missing one.** Do not recommend memoization on the
 strength of a render count alone. Show the cost first: the work is genuinely expensive over a real

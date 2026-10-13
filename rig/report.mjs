@@ -13,7 +13,8 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { RIG, parseArgs, loadRun, resolveIn, readJson, exists, median, importScenario, CALL_P, called, controlVerdict, controlText, passRole, verdictMetrics, countKeys } from './lib.mjs';
+import { RIG, parseArgs, loadRun, resolveIn, readJson, exists, median, importScenario, CALL_P, called, controlVerdict, controlText, passRole, verdictMetrics, countKeys, PROFILES } from './lib.mjs';
+import { compilerText } from './fingerprint.mjs';
 
 const args = parseArgs();
 const run = loadRun(args.run);
@@ -150,6 +151,21 @@ const pcoreText = side => {
 };
 const placementFlags = (S.advice && S.advice.placement) || [];
 const loads = sideKeys.flatMap(k => sessionsOf(k).map(s => s.load && s.load[0]).filter(x => typeof x === 'number'));
+// which build each side ran: the commit its sessions' bundles carried, checked against the build's own fingerprint
+const buildText = k => {
+    const s = S.run.sides[k];
+    const fp = s.fingerprint;
+    const ran = s.commit || null;
+    const want = s.buildSha || s.sha || null;
+    const seen = sessionsOf(k).map(x => x.env && x.env.build && x.env.build.verified).filter(v => v !== undefined && v !== null);
+    const proof = !ran ? 'commit not recorded (sessions from before the build proof)'
+        : want ? (ran === want ? `${short(ran)} in every session${seen.length && seen.every(v => v === true) ? ' (seen in the loaded bundle)' : ''} ✓` : `${short(ran)} — NOT the pinned ${short(want)}`)
+            : `${short(ran)} in every session (deployed preview)`;
+    const rel = fp && fp.release ? ` · ${fp.release.version}.${fp.release.suiteType}${fp.release.codesign ? '.codesign' : ''}` : '';
+    const prof = s.profile ? ` · ${s.profile} profile` : '';
+
+    return `${proof}${rel}${prof}${s.url ? ` · ${s.url}` : ''}`;
+};
 const sideCard = (k, i) => {
     const s = S.run.sides[k];
     const f = firstSession(k) || {};
@@ -160,12 +176,15 @@ const sideCard = (k, i) => {
     const ratio = rates.length > 1 ? (median(calib[rates[rates.length - 1]]) / median(calib[rates[0]])).toFixed(2) : null;
     const canary = env.canary ? (median(env.canary.spread) / Math.max(0.1, median(env.canary.slice))).toFixed(1) : null;
     const idle = f.idle ? Object.entries(f.idle).map(([r, v]) => `${r}x ${v.taskPerS} ms/s`).join(' · ') : '';
-    const markers = env.markers ? Object.entries(env.markers).map(([n, c]) => `${esc(n)} ×${c}`).join(', ') : '';
+    // explicit markers only: the commit needles are the build proof below
+    const markers = env.markers ? Object.entries(env.markers).filter(([n]) => !/^[0-9a-f]{40}$/.test(n)).map(([n, c]) => `${esc(n)} ×${c}`).join(', ') : '';
 
     return `<div class="sidecard${i ? ' b' : ''}"><h3>${esc(sideLabel(k))}</h3><dl class="kv">
-<dt>revision</dt><dd><code>${esc(short(s.sha || s.rev))}</code>${s.variant ? ` + ${esc(s.variant)}` : ''}</dd>
+<dt>revision</dt><dd><code>${esc(short(s.sha || s.rev))}</code>${s.variant ? ` + ${esc(s.variant)}${s.buildSha ? ` = <code>${esc(short(s.buildSha))}</code>` : ''}` : ''}</dd>
+<dt>build</dt><dd>${esc(buildText(k))}</dd>
+<dt>React Compiler</dt><dd>${esc(s.fingerprint ? compilerText(s.fingerprint.compiler, 6) : '–')}</dd>
 <dt>sessions</dt><dd>${sessionsOf(k).length} (${sessionsOf(k).filter(x => x.complete).length} complete)</dd>
-<dt>code markers</dt><dd>${markers || '–'}</dd>
+${markers ? `<dt>code markers</dt><dd>${markers}</dd>` : ''}
 <dt>coverage files</dt><dd>${env.coverageFiles ?? '–'}</dd>
 <dt>React renderers</dt><dd>${env.renderers ?? '–'}${env.desktopLaunches > 1 ? ` (desktop: ${env.desktopLaunches} launches)` : ''}</dd>
 <dt>calibration loop</dt><dd>${esc(cal)}${ratio ? ` → ${ratio}x` : ''}</dd>
@@ -201,7 +220,24 @@ ${problems.length ? `<div class="callout"><p><b>${problems.length} iterations dr
     return `<section><h2>${esc(passLabel(p))}</h2>${meta.cfg ? `<p class="note">cfg <code>${esc(JSON.stringify(meta.cfg))}</code></p>` : ''}${blocks}</section>`;
 }).join('\n');
 
+const base = S.run.base;
+const baseCaveat = !base ? `Revisions not checked against their target branch (sides pinned by hand).`
+    : base.mode === 'merge-ref' ? `B was ${base.behind} commits behind <code>origin/${esc(base.branch)}</code>; measured as GitHub's merge of the PR into it (B = the merge commit, A = its first parent${base.mergeRefLag ? `, ${base.mergeRefLag} commits behind the tip at the time` : ''}).`
+        : base.mode === 'merge-base' ? `B was ${base.behind} commits behind <code>origin/${esc(base.branch)}</code> and was measured on its own fork point (A = the merge-base): the branch's own commits, on a base ${base.behind} commits older than today's — a rebase can change the result.`
+            : `B was up to date with <code>origin/${esc(base.branch)}</code> when pinned (${esc(String(base.checkedAt).slice(0, 10))}); A is that tip, so exactly the branch's ${base.ahead} commits apart.`;
+const sideProfiles = [...new Set(sideKeys.map(k => S.run.sides[k].profile).filter(Boolean))];
+const profileCaveat = sideProfiles.length > 1 ? `The sides are built with different profiles (${sideKeys.map(k => `${esc(k)} ${esc(S.run.sides[k].profile || '–')}`).join(', ')}): this is a build-config comparison, not only a code one.`
+    : S.run.profile === 'release' ? 'Release profile (IS_CODESIGN_BUILD=true, as installed by users): no redux-logger. The bundled message-system config is signed with the development key, which a codesign build rejects: no message-system banners on either side.'
+    : S.run.profile === 'preview' ? 'Preview profile (IS_CODESIGN_BUILD unset, as CI previews): redux-logger logs every dispatch on both sides, which inflates absolute numbers and per-dispatch costs and keeps logged states reachable.'
+        : null;
+const compilerDiffers = (() => {
+    const t = sideKeys.map(k => S.run.sides[k].fingerprint && S.run.sides[k].fingerprint.compiler && S.run.sides[k].fingerprint.compiler.files);
+
+    return t.every(x => typeof x === 'number') && new Set(t).size > 1;
+})();
 const autoCaveats = [
+    baseCaveat,
+    profileCaveat,
     S.run.device === 'synthetic' ? 'Synthetic state: seeded store and mocked backend, identical on both sides; no device and no network.' : `Device: ${esc(S.run.device)} (trezor-user-env emulator) — real connect flow; backend latency adds noise to wall times, CPU totals are less affected.`,
     'Percentiles pool iterations from several page sessions; iterations inside a session are correlated, so the session columns decide whether a timing difference is real.',
     `One machine${loads.length ? `, 1-min load average ${Math.min(...loads)}–${Math.max(...loads)} at session starts` : ''}; numbers do not transfer to other hardware, only the direction and the session separation do.`,
@@ -230,7 +266,8 @@ ${N.findings && N.findings.length ? `<section><h2>Findings</h2><ul>${N.findings.
 ${(N.sections || []).map(s => `<section><h2>${esc(s.title)}</h2>${s.html}</section>`).join('\n')}
 ${passSections}
 <section><h2>Builds and rig health</h2>${placementFlags.length ? `<div class="callout"><p><b>Efficiency-core placement differs between the sides.</b> ${placementFlags.map(f => esc(`${passLabel(f.pass)} @ ${f.rate}x: ${f.text}.`)).join(' ')}</p></div>` : ''}<div class="sidecards">${sideKeys.map(sideCard).join('')}</div>
-<p class="note">Code markers are source strings found in the running bundle's modules: they prove which build each side ran. The calibration loop is a fixed busy loop per CPU rate (the higher rate should read about that many times slower). The spread/slice canary reads about 1 without a debugger and about 25 when a DevTools debugger taxes spreads.</p>
+${compilerDiffers ? `<div class="callout"><p><b>The sides differ in React Compiler coverage.</b> ${sideKeys.map(k => esc(`${k}: ${compilerText(S.run.sides[k].fingerprint.compiler, 4)}`)).join(' · ')}. Manual memoization reads differently on each side: redundant where compiled, the only mechanism where not.</p></div>` : ''}
+<p class="note">Every Suite bundle inlines the commit it was built from (COMMITHASH and the release string): the build's fingerprint checks it against the clone, and every session found its own side's commit and no other side's in the loaded modules — no hand-picked marker needed. React Compiler coverage counts the compiler's memo blocks (<code>react.memo_cache_sentinel</code>), mapped to source files through the source maps. The calibration loop is a fixed busy loop per CPU rate (the higher rate should read about that many times slower). The spread/slice canary reads about 1 without a debugger and about 25 when a DevTools debugger taxes spreads.</p>
 ${S.advice && S.advice.next && S.advice.next.length ? `<p class="note">Could more sessions change a verdict? ${(S.advice.controls || []).filter(c => c.state && c.state !== 'failed').map(c => esc(controlText(c, `${c.pass} @ ${c.rate}x`))).concat(S.advice.next.map(esc)).join(' · ')}</p>` : ''}</section>
 <section><h2>Caveats</h2><ul>${autoCaveats.concat(N.caveats || []).map(c => `<li>${c}</li>`).join('')}</ul></section>
 <section><h2>Method</h2><ul>

@@ -63,7 +63,10 @@ nothing is host-mapped; analytics and Sentry are still answered locally.
 - **Never poll the emulator screen during a device prompt** (`emulator-get-screen-content`, the MCP's
   screenshot): it broke a signing session in the QA harness. Wait on
   `selectedDevice.buttonRequests` in the store instead, and press with `tenv.mjs yes`.
-- One emulator serves one session at a time; sessions run sequentially anyway.
+- One emulator serves the whole machine. A session takes the `emulator` lock before the machine
+  slot (`references/builds.md`), so emulator runs of several agents take turns, and `open.mjs` holds
+  it while an exploration is open. `tenv.mjs down` and `tenv.mjs prepare` refuse while someone else
+  holds it (`--force` overrides).
 - After `bridge-stop`, web Connect falls back to WebUSB until a reload: restart the session instead.
 - Live backends: wall times include network latency and its variance; a backend hiccup shows as
   one slow session. More sessions, CPU metrics, and say so in the caveats.

@@ -83,21 +83,17 @@ baselined against is not retained anywhere once it is replaced. Two consequences
   delta collapses toward zero and the report reads "no regression" — the exact failure this skill
   exists to prevent, arriving through the back door.
 
-Record the baseline identity at session start and read it again at the end, most to least reliable:
-
-```bash
-git rev-parse origin/develop origin/<branch>           # what you intend to compare
-curl -s  <base>/js/main.<hash>.js | grep -oE '[0-9.]+\.web\.[0-9a-f]{40}'   # SENTRY_RELEASE.id
-curl -sI <base>/js/main.<hash>.js | grep -iE 'last-modified|etag'
-```
-
-`window.SENTRY_RELEASE.id` is `<version>.web.<40-hex sha>` and resolves directly against the
-checkout — on 2026-09-14 the develop preview reported `26.10.0.web.d0d87f04…`, exactly
-`origin/develop` at that moment. It exists **only on the develop preview**: the Sentry webpack
-plugin is gated on `!isDev && sentryAuthToken`, and only `build-suite-web.yml` has
-`SENTRY_AUTH_TOKEN`. A PR preview never carries it, so for the branch side the fingerprint is
-`git rev-parse origin/<branch>` plus the content-hashed `main.<hash>.js` filename and
-`last-modified`/`etag`.
+The rig fingerprints every session instead of trusting a URL: **every bundle inlines the commit it
+was built from**, PR previews included — `process.env.COMMITHASH` and the release string
+`process.env.SENTRY_RELEASE` = `<version>.web[.codesign].<40-hex sha>` are DefinePlugin values
+(`packages/suite/webpack/createBaseConfig.ts`), so they need no Sentry token. Each session reads the
+commit from the modules it loaded (`env.build.commit`); `plan.mjs` stops when a preview side serves
+another commit than its earlier sessions, and `aggregate.mjs` refuses to pool a side whose sessions
+ran two commits (`--allow-mixed-builds` overrides, with a warning). What exists **only on the develop
+preview** is `window.SENTRY_RELEASE` — the Sentry webpack plugin's global, gated on `!isDev &&
+sentryAuthToken`, which only `build-suite-web.yml` has: on 2026-09-14 it read `26.10.0.web.d0d87f04…`,
+exactly `origin/develop` at that moment. By hand, the release string is in one of the app's chunks
+(not `main.<hash>.js` any more): grep every chunk for `[0-9.]+\.web(\.codesign)?\.[0-9a-f]{40}`.
 
 The same gate produces a third asymmetry worth knowing: the Sentry plugin uploads source maps and
 deletes them, so `*.js.map` is **404 on develop and 200 on every PR preview** (verified on both).
@@ -426,10 +422,14 @@ the rest are for reading results.
 - **CDP thread time and the V8 profile can disagree** on promise-heavy code: CDP filed a PR's
   IndexedDB win under "other" (non-script) time and read +20% script; the source-mapped profile
   showed the idb wrapper 220 → 35 ms. Totals from CDP, attribution from `attr.mjs`.
-- **Local builds run redux-logger** (`!isCodesignBuild()` in `packages/suite/src/reducers/store.ts`)
-  and the dashboard's recharts re-renders on every store change: equal on both sides, but they
-  inflate absolute numbers and keep logged states reachable (post-GC heap). Say so when quoting
-  absolute values.
+- **Non-codesign builds run redux-logger** (`!isCodesignBuild()` in
+  `packages/suite/src/reducers/store.ts`): every dispatch is logged, and with CDP's Runtime domain on
+  (Playwright's) serialized into the console and kept reachable: 200 no-op dispatches took 224 ms of
+  main-thread CPU at 4x in a preview build and 24.8 ms in a release build of the same commit (~1 ms
+  per dispatch). Its cost follows the number of dispatches — what perf PRs change. The rig builds the `release`
+  profile (`IS_CODESIGN_BUILD=true`) by default for that reason; CI previews and `--profile=preview`
+  builds have it (`references/builds.md`). The dashboard's recharts re-renders on every store change
+  either way: say so when quoting absolute values.
 - **Motion baseline.** A frame's rAF timestamp can precede the input's `event.timeStamp` while
   that frame already sees the post-input layout. Take a synchronous `getBoundingClientRect`
   baseline when arming and compare `performance.now()` in callbacks, not `ts`.
@@ -460,6 +460,23 @@ the rest are for reading results.
   it); `git status` in a clone talks to the original's fsmonitor daemon until `core.fsmonitor` is
   off; peers switch the main checkout's branch mid-run — never build in the shared tree. A built
   clone holds ~1-2 GiB of real blocks: check disk (`preflight.mjs`).
+- **A clone inherits the checkout's untracked files.** `.env.local` (loaded by the webpack config
+  through dotenv) carried a developer's build knobs into every build; generated, git-ignored files
+  (the message-system config, browser-detection, favicon, the transport-bridge UI) were bundled as
+  the checkout last generated them — on 2026-10-13 the checkout's message-system config was eight
+  days old, and two clones made on different days bundle different content. `build.mjs` sets
+  `.env.local` aside and regenerates what CI regenerates; the guide content (network) is compared
+  by hash in preflight.
+- **The checkout's yarn cache lags the target branch.** A develop tip newer than the checkout's last
+  install locks packages its offline cache never saw (`YN0080 … blocked`). `build.mjs` installs
+  again with the network and keeps the fetched packages for later clones. In an agent sandbox yarn
+  berry ignores `HTTPS_PROXY` (handed over as `YARN_HTTPS_PROXY`), a burst of 50 downloads gets
+  "The server aborted pending request" from the proxy (8 at a time), and the global mirror under
+  `~/.yarn` is not writable (mirror off).
+- **The feature branch behind its target.** PR #32496 was 123 commits behind develop, 20 files
+  changed on both sides, `yarn.lock` moved: measured against today's develop it would be charged with
+  all of that, measured on its fork point it runs on a base that no longer exists. `revs.mjs` stops
+  and advises a rebase (`references/builds.md`).
 - **Agent tooling**: `chmod +x` prompts even in bypass mode; `rsync` is denied by a permission
   rule (use `cp -R`); `ps`, the docker socket and local WebSockets are blocked inside the Bash
   sandbox; Chromium and Electron need it off; foreground `sleep` is blocked — run plans in the

@@ -168,11 +168,37 @@ export const nvmrcNode = dir => {
     return { version: process.versions.node, bin: process.execPath, exact: false, want };
 };
 
+// ------------------------------------------------------------------ build profiles
+/**
+ * How a side is built: run.json `build.profile` for every side, or build.mjs --profile (with --sides,
+ * for some sides only: a build-config A/B of one commit). Each profile builds in its own clone, so
+ * both can sit in the cache side by side.
+ *   release  IS_CODESIGN_BUILD=true — what users install: no redux-logger (which logs every
+ *            dispatch, and with CDP's Runtime domain on, previews the logged states and keeps them
+ *            reachable), production endpoints, analytics and logger isDev off. The bundled
+ *            message-system config is signed with the development key (the production key never
+ *            leaves CI), so its codesign check rejects it: no message-system banners on either side.
+ *   preview  IS_CODESIGN_BUILD unset — what CI previews (dev.suite.sldev.cz) and the e2e builds are.
+ */
+export const PROFILES = {
+    release: { env: { IS_CODESIGN_BUILD: 'true' }, codesign: true, about: 'IS_CODESIGN_BUILD=true, as released: no redux-logger, production endpoints' },
+    preview: { env: {}, codesign: false, about: 'IS_CODESIGN_BUILD unset, as CI previews: redux-logger on every dispatch, develop endpoints' },
+};
+export const DEFAULT_PROFILE = 'release';
+/** The run's build profile: --profile, run.json build.profile, else release. */
+export const profileOf = (run, flag) => {
+    const p = String(flag || (run && run.build && run.build.profile) || DEFAULT_PROFILE);
+    if (!PROFILES[p]) throw new Error(`unknown build profile ${p} (${Object.keys(PROFILES).join(' | ')})`);
+
+    return p;
+};
+
 // ------------------------------------------------------------------ sides
 /**
- * A side is { label, rev, sha, web, desktop, url, variant, patch, markers }: `web` is a production
- * web build dir, `desktop` a built suite/desktop-app dir, `url` a deployed preview.
- * build.mjs fills sha/web/desktop.
+ * A side is { label, rev, sha, buildSha, profile, clone, web, desktop, fingerprint, url, variant,
+ * patch, markers }: `web` is a production web build dir, `desktop` a built suite/desktop-app dir,
+ * `url` a deployed preview. revs.mjs pins rev; build.mjs fills sha, buildSha (the commit the bundle
+ * carries: sha, or the variant's own commit), profile, clone, web, desktop and fingerprint.
  */
 export const sideOf = (run, key) => {
     const s = run.sides && run.sides[key];
@@ -180,6 +206,11 @@ export const sideOf = (run, key) => {
 
     return { key, ...s, web: resolveIn(run.dir, s.web), desktop: resolveIn(run.dir, s.desktop) };
 };
+
+/** The commit a side's bundle carries: build.mjs's buildSha (a variant's own commit) or sha; null for a preview. */
+export const sideCommit = s => (s && (s.buildSha || s.sha)) || null;
+/** The commit a session ran: what the page reported (env.build), else what the runner was told. */
+export const sessionCommit = d => (d && d.env && d.env.build && d.env.build.commit) || (d && d.meta && (d.meta.buildSha || d.meta.sha)) || null;
 
 // ------------------------------------------------------------------ statistics
 export const finite = a => a.filter(x => typeof x === 'number' && Number.isFinite(x));
@@ -352,7 +383,7 @@ export const SESSION_FILE = /^(.+)-(\d+)-([A-Za-z0-9]+)\.json$/;
  */
 export const SPARES = 8;
 // run.mjs flags that are not the pass's configuration: never in meta.argv, never compared
-const NOT_PASS = /^--(run|side|out|repo|progress|role|pcore[\w-]*|max-ecore-[\w-]+)=/;
+const NOT_PASS = /^--(run|side|out|repo|progress|role|slot|pcore[\w-]*|max-ecore-[\w-]+)=/;
 /** The arguments that identify a pass's configuration (meta.argv; plan.mjs compares them). */
 export const passArgv = argv => argv.filter(a => !NOT_PASS.test(a));
 
@@ -363,6 +394,13 @@ export const passArgv = argv => argv.filter(a => !NOT_PASS.test(a));
  */
 export const progressText = (p, now = Date.now()) => {
     if (!p) return 'starting';
+    // waiting for the machine slot (rig/locks.mjs): another run's session or build has the machine
+    if (p.stage === 'queued') {
+        const q = p.queue || {};
+        const since = q.since ? ` · ${dur(now - Date.parse(q.since))}` : '';
+
+        return `queued for the machine${q.holder ? ` · ${q.holder}` : ''}${q.ahead > 1 ? ` · ${q.ahead} ahead` : ''}${since}`;
+    }
     const perRate = ['calibrate', 'idle', 'warm-up', 'measure', 'profile', 'pcore-wait', 'ready'].includes(p.stage);
     const iter = perRate && Number.isInteger(p.iteration) ? `it ${p.iteration + 1}/${p.k}` : null;
     const g = p.gate;

@@ -8,15 +8,16 @@ All Node code is ES modules (`.mjs`, `node:` built-ins, packages from the checko
 `import()`), zero-dependency, written for the latest Node LTS (24: `import.meta.main`,
 `Promise.withResolvers`, `util.parseArgs`, global `fetch`/`WebSocket`). `build.mjs` runs yarn with the
 Node of the revision's `.nvmrc` when nvm has it (`$NVM_DIR/versions/node/v<version>`), else the
-running Node with a warning; `--node=<binary>` overrides.
+running Node with a warning; `--node=<binary>` overrides. Why the pair, the recipe, the profiles, the
+commit proof and the locks are what they are: `references/builds.md`.
 
 ## Layout
 
 ```
 $PERF_AB_HOME (default ~/.local/share/suite-perf-ab — writable from the Bash sandbox, outside every worktree)
   runs/<run-id>/
-    run.json          sides, target, device, scenario path            (you write it)
-    plan.json         passes                                           (copy rig/templates/plan.json)
+    run.json          sides, target, device, profile, scenario path    (revs.mjs creates it; you add the rest)
+    plan.json         passes                                           (rig/templates/plan.json)
     scenario/         scenario.mjs + page.js                           (copy rig/templates/, or point at examples/)
     narrative.json    verdict text for the report                      (you write it, last)
     preflight.json    last preflight result
@@ -27,9 +28,14 @@ $PERF_AB_HOME (default ~/.local/share/suite-perf-ab — writable from the Bash s
     summary.json      aggregate.mjs output, advice included
     report.html       report.mjs output
     traces/           DevTools MCP traces moved here (the MCP can only write inside the session cwd)
-  clones/<sha12>[-<variant>]/   copy-on-write clone + its build, reused by every run on that commit
+    open-<side>.json  pid, CDP port and URL of a live open.mjs session
+  clones/<sha12>[-<variant>].<profile>/   copy-on-write clone + its build, reused by every run on that commit
+    .perf-ab-build.json   its state: sha, buildSha, profile, prep, targets with their fingerprints
+    .perf-ab-users/       live sessions and explorations serving it (pid files)
   apps/<run>-<side>/            desktop --user-data-dir of each session (wiped at start)
-  profiles/web-<side>/          persistent Chromium profile of an open.mjs session
+  profiles/<run>-web-<side>/    persistent Chromium profile of an open.mjs session
+  locks/<name>/                 FIFO lock queues: machine, clone-<name>, emulator (rig/locks.mjs)
+  yarn-cache/                   packages fetched for revisions newer than the checkout's cache
   timings.json                  the last 5 durations of every build step, for build.mjs's estimates
 ```
 
@@ -45,7 +51,9 @@ fails a session or a build.
 | Script | Sandbox | Why |
 | --- | --- | --- |
 | `preflight.mjs` | either (off sees `ps`, ports, docker) | read-only |
-| `build.mjs` | on | clones under `~/.local/share`, offline yarn, webpack |
+| `revs.mjs` | on (network: `github.com`, `api.github.com`) | fetches into the checkout's `.git` |
+| `build.mjs` | on (network: `registry.yarnpkg.com` when the cache lacks packages) | clones under `~/.local/share`, yarn, webpack |
+| `fingerprint.mjs` | on | files only |
 | `run.mjs`, `plan.mjs`, `open.mjs` | **off** | Chromium/Electron die on the Mach-port rendezvous inside it |
 | `tenv.mjs` | **off** | docker socket, local WebSocket |
 | `aggregate.mjs`, `report.mjs`, `status.mjs`, `attr.mjs`, `cleanup.mjs` | on | files only |
@@ -64,25 +72,33 @@ Never `chmod +x` anything: it prompts even in bypass mode. Every script runs as 
   "device": "synthetic",                      // synthetic | emulator (references/emulator.md)
   "network": "none",                          // none (default for synthetic) | live
   "emulator": { "model": "T3T1", "fw": "2-latest", "mnemonic": "mnemonic_all" },  // "prepare": false = use the device already on the bridge
+  "build": { "profile": "release" },          // release (IS_CODESIGN_BUILD=true, default) | preview
   "scenario": "scenario/scenario.mjs",
   "cfg": {},                                  // scenario cfg overrides for every pass
+  "base": { "branch": "develop", "tip": "…", "mergeBase": "…", "behind": 0, "ahead": 3, "mode": "tip", "state": "up-to-date", … },  // revs.mjs
   "sides": {
-    "A": { "label": "develop (merge-base)", "rev": "163bed71c0", "markers": { "`transactions:${": 0 } },
-    "B": { "label": "PR head", "rev": "38f4a19936", "markers": { "`transactions:${": 1 } },
-    "B2": { "label": "PR + revert of X", "rev": "38f4a19936", "patch": "revert-x.diff", "variant": "revert-x" }
+    "A": { "label": "develop", "rev": "163bed71c0…" },
+    "B": { "label": "PR #33320", "rev": "38f4a19936…" },
+    "B2": { "label": "PR + revert of X", "rev": "38f4a19936…", "patch": "revert-x.diff", "variant": "revert-x" }
   }
 }
 ```
 
-- `rev` is anything `git rev-parse` resolves in the main checkout. Fetch PR heads first:
-  `git fetch origin pull/<n>/head`. Pin SHAs, not branch names, so a push mid-run cannot move a side.
-- `markers`: a source string per side and the number of bundle modules expected to contain it (0 on
-  the side without the change, ≥1 on the side with it). `run.mjs` aborts a session whose build
-  does not match; `preflight.mjs` greps the build offline. Pick a string the minifier keeps:
-  a template literal, an action type, an error message, a property name.
-- `build.mjs` adds `sha`, `web` (the build dir) and `desktop` (the `suite/desktop-app` dir).
+- `revs.mjs` writes `base` and `sides.A/B.rev` (full SHAs: a push mid-run cannot move a side) and
+  creates the run folder when needed. `base.state`: `up-to-date`, `behind-accepted` (with `mode`
+  `merge-base` | `merge-ref`), or `behind` — nothing pinned, `build.mjs` refuses. Sides written by
+  hand (`rev`: anything `git rev-parse` resolves in the main checkout) skip the check.
+- `build.mjs` adds per side `sha`, `buildSha` (a variant's own commit, when it has a `patch`),
+  `profile`, `clone`, `web` (the build dir), `desktop` (the `suite/desktop-app` dir), `fingerprint`
+  per target (commit, release, coverage, React Compiler coverage) and `guide` (the inherited guide
+  content's hash).
+- `markers` (optional): a source string and the number of bundle modules expected to contain it.
+  The commit proves which build ran; a marker proves a given piece of code is in it (not
+  tree-shaken, not behind a flag). `run.mjs` aborts a session whose build does not match;
+  `preflight.mjs` greps the build offline. Pick a string the minifier keeps.
 - A side with `url` (a deployed preview) is loaded as is, nothing built: compare like with like,
-  and check `env.coverageFiles` — PR previews are Istanbul-instrumented, develop's are not.
+  and check `env.coverageFiles` — PR previews are Istanbul-instrumented, develop's are not. Its
+  commit is recorded per session (`env.build.commit`).
 - More than two sides work everywhere except the report, which pairs the first two.
 
 ## plan.json
@@ -119,7 +135,7 @@ sessions in total (2 v 3 reaches 0.1, 3 v 3 0.1, 4 v 4 separated 0.029); 2 v 2 c
 node rig/run.mjs --run=<id|dir> --side=A --out=<file.json>
      [--k=8] [--rates=4,1] [--warmup=2] [--cfg.<key>=<v>] [--alt-inject=10] [--target=web|desktop]
      [--profile-at=<iter>] [--idle-ms=10000] [--headed] [--phase-timeout-ms=600000] [--allow-coverage]
-     [--progress=<file>|false] [--role=timing|control|trial|counts]
+     [--progress=<file>|false] [--role=timing|control|trial|counts] [--slot=off]
      [--pcore=auto|off] [--pcore-free=2] [--pcore-max-wait-s=900] [--max-ecore-ms=15] [--max-ecore-pct=2] [--pcore-retries=5]
 ```
 
@@ -134,14 +150,21 @@ command line or in plan.json — never makes a session stale. What does: the see
 `RUN.spares` = 8 spare targets (lib.mjs `SPARES`, independent of every flag) and records
 `meta.spares`; a record without it, or with another count, is stale.
 
-Sequence: [device=emulator: wipe + seed the emulator, start the bridge] → launch (web: headless
+Sequence: register as a user of the side's clone → [device=emulator: the `emulator` lock] → the
+`machine` slot (stage `queued` while another session or build step of any run holds it; the wait is
+`meta.timing.queueMs`, left out of the overhead the ETA learns) → [device=emulator: wipe + seed the
+emulator, start the bridge] → launch (web: headless
 Chromium, build served from disk at `http://suite.localhost/` through routes, every other host
 unresolvable; desktop: Electron on the side's app dir with its own profile, relaunched if the init
 script missed the first load — references/desktop.md) → init
 script `window.Playwright = true; __CFG; __RUN; rig/page/core.js; <scenario page.js>` → wait
 `__A.ready()` → `__A.seed()` → wait `__A.isReady()` (default: Suite lifecycle ready, router
 loaded, no loading screen) → `__A.postInit()` → `scenario.nodeSetup(ctx)` → `__H.goto(route)` →
-env checks (coverage 0, React hook installed before react-dom, markers, `scenario.check`) →
+env checks (coverage 0, React hook installed before react-dom; the build: this side's commit
+present in the loaded modules and no other side's, the release string's commit and codesign flag
+matching the side — `env.build` = { commit, release, modules, sentinelModules, expected, verified:
+true | 'offline' (not loaded yet: the build's fingerprint vouches) | null (a preview) }; markers;
+`scenario.check`) →
 per rate: `Emulation.setCPUThrottlingRate`, calibration loop ×5, idle window, then k × ([measured
 iterations: the performance-core gate] → `__A.before` → warm-up spins → every phase with
 `Performance.getMetrics` (thread ticks) read at its boundaries [and the watchdog] → `__A.after`) →
@@ -154,7 +177,8 @@ snapshot written atomically on every stage change and iteration boundary, otherw
 second, and at least every 30 s as a keepalive: `{ session, side, pid, startedAt, updatedAt, stage,
 stageAt, rate, rates, rateIndex, iteration, k, warmup, phase, unitsDone, unitsTotal, iterMs: {
 <rate>: [wall ms per finished iteration] } }`.
-`stage` follows the code: `emulator`, `launch`, `seed`, `checks`, then per rate `calibrate`,
+`stage` follows the code: `queued` (with `queue: { lock, holder, ahead, since }`), `emulator`,
+`launch`, `seed`, `checks`, then per rate `calibrate`,
 `idle`, `warm-up` (the iterations aggregate discards), `measure` (`profile` for the
 `--profile-at` iteration), `pcore-wait` / `ready` while the gate waits (with `gate: { free, total,
 since | attempts, share, ghz, ref }`), then `done` — or `failed` / `interrupted` with `error`.
@@ -305,8 +329,8 @@ per rate (`ready`) and the renderer's normal priority per target (`pri`). `--max
 `plan.mjs` is superseded by the gate and stays for machines without it.
 
 ```js
-{ meta: { run, side, label, rev, sha, build, target, device, network, scenario, cfg, k, rates, warmup, idleMs, altInject, host, browser, started, finished, timing },
-  complete, env: { coverageFiles, hook, renderers, markers, canary, ua, dpr, inner, store, connect, sentry, verify, desktopLaunches, ... },
+{ meta: { run, side, label, rev, sha, buildSha, variant, profile, build, target, device, network, slot, scenario, cfg, k, rates, warmup, idleMs, altInject, host, browser, started, finished, timing: { …, queueMs } },
+  complete, env: { coverageFiles, hook, renderers, markers, build, canary, ua, dpr, inner, store, connect, sentry, verify, desktopLaunches, ... },
   seed, post, calib: { <rate>: [ms x5] }, idle: { <rate>: { ms, taskMs, commits, ... } },
   runs: [ { rate, iter, n, inject, load1m, before, phases: { <name>: <phase record> }, after, problem } ],
   end, hits: { served, missing, definitions, telemetry, aborted }, diag: [console errors/warnings] }
@@ -337,7 +361,8 @@ attempt: back to where iterations start, false if it cannot; default `after(it)`
 `verify()`; `it = { i, n, rate }` (`n` counts iterations over the whole session, retries included —
 use it to give every iteration fresh data, and seed `RUN.iterations + RUN.spares + 1` targets).
 
-`window.__H` (rig/page/core.js): `CFG`, `RUN`, `store()` (window.store on web with `window.Playwright`,
+`window.__H` (rig/page/core.js): `CFG`, `RUN`, `buildInfo()` (the running build's release string,
+commit and how many loaded modules carry React Compiler output), `store()` (window.store on web with `window.Playwright`,
 desktop with `--expose-store`, else the react-redux Provider), `state()`, `dispatch()`, `connect()`
 (TrezorConnect as the app calls it; desktop has no `window.TrezorConnect`), `findThunk(typePrefix)`
 and `findModules(needle)` (production bundle lookups via `__webpack_require__`; desktop bundles keep
@@ -370,8 +395,14 @@ Rules the contract encodes:
 ```
 node rig/plan.mjs --run=<id> [--plan=<file>] [--only=main,ctl] [--dry] [--retries=1] [--heartbeat=30]
      [--pcore=auto|off] [--pcore-free=2] [--pcore-max-wait-s=900] [--max-ecore-ms=15] [--max-ecore-pct=2] [--pcore-retries=5]
-     [--max-load=6] [--max-wait-s=900]
+     [--slot=off] [--max-load=6] [--max-wait-s=900]
 ```
+
+Builds: a complete session made from another commit than its side's current build (`sideCommit`:
+`buildSha` or `sha` — the side was re-pinned or rebuilt) is stale and runs again. A deployed-preview
+side that serves another commit than its earlier sessions stops the plan (develop redeployed): its
+sessions cannot pool. Parallel runs: every session waits for the machine slot, so two plans
+interleave their sessions one at a time; the start line says when another run holds the machine.
 
 The `pcore` flags go to every session (run.mjs, "Performance cores" above); a discard prints its
 own line with its cause (`main-2-A 4x it 3/8 discarded — main thread ran 21.2 ms on efficiency
@@ -436,7 +467,9 @@ time 0:01:41 elapsed · ETA 0:00:05 · finish ≈ 11:45
 last main-2-B exit 0 in 0:26 · 4 iterations · 11:45
 ```
 
-The `now` line also says how long the current stage has run. It flags (`! …`) a plan or session
+The `now` line also says how long the current stage has run (a session waiting for the machine reads
+`queued for the machine · <holder> · <wait>`), and a `machine` line names who holds the machine slot
+and who waits when another run is involved. It flags (`! …`) a plan or session
 whose pid is gone while its state says running (crashed or killed: run the plan again to resume),
 and a session snapshot older than 2 min (stuck: a live session writes one at least every 30 s; the
 line names the stage and the session log). With no plan running it shows the last plan's final
@@ -450,8 +483,16 @@ as an agent's wait.
 ## aggregate.mjs
 
 ```
-node rig/aggregate.mjs --run=<id> [--passes=main,ctl] [--print=main] [--warmup=<n>] [--all]
+node rig/aggregate.mjs --run=<id> [--passes=main,ctl] [--print=main] [--warmup=<n>] [--all] [--allow-mixed-builds]
 ```
+
+Builds first: the commit every session ran (`env.build.commit`, else `meta.buildSha`/`meta.sha`). A
+side whose sessions ran more than one commit is refused — exit 2, no summary — unless
+`--allow-mixed-builds` (then a warning in the summary and the report). A side whose sessions all ran
+another commit than `run.json` now pins gets a warning (plan.mjs reruns them). `summary.run` carries
+`profile`, `base` (the revision check) and per side `commit`, `commits` (sessions per commit),
+`profile`, `fingerprint` (of the run's target) and `guide`; the console ends with one `build` line
+per side (commit, profile, release, React Compiler coverage).
 
 Per pass × rate × side: kept iterations (after warm-up, no problem, inject = 0), every metric as
 `<phase>.<field>`, `total.<field>` (additive fields summed over phases), `after.<field>`,
@@ -495,7 +536,9 @@ node rig/report.mjs --run=<id> [--narrative=<file>] [--out=<file>] [--main=<pass
 ```
 
 Self-contained HTML (inline CSS/SVG, Google Fonts), light and dark, no horizontal scroll at phone
-width. Verdict cards (from `narrative.json`, or generated from the first four headline metrics
+width. The side cards carry the build proof (the commit every session ran, ✓ against the pinned one,
+the release string, the profile) and the React Compiler coverage; a callout when the sides differ in
+it; caveats on how the revisions were pinned and on the profile. Verdict cards (from `narrative.json`, or generated from the first four headline metrics
 of the main pass — the first timing pass, or `--main`; never a counting, trial or control pass,
 and "no timing pass yet" without one; a direction is only called when sessions separate with
 p ≤ 0.1), findings and custom
@@ -506,9 +549,12 @@ Artifact tool.
 
 ## Other scripts
 
-- `build.mjs --run=<id> [--targets=web,desktop] [--sides=A,B] [--rebuild] [--network-install] [--node=<binary>]` — see SKILL.md step 3. Prints the steps and an estimate up front, numbers them per side (`[A 3/4] web build … (last 0:52)` … `[A 3/4] web build done in 0:53`, a heartbeat every 30 s in between; step output goes to `<clone>/.perf-ab-logs/`, never stdout), keeps the last 5 durations per step in `$PERF_AB_HOME/timings.json`, and writes `build-status.json` (side, step i/n, start, estimate, ETA, state; `interrupted` on SIGINT/SIGTERM) for `status.mjs`. Each side's state is read again when its turn comes, so an A/A run on one clone builds once.
-- `open.mjs --run=<id> --side=B [--target] [--port=9222] [--headed] [--no-seed] [--minutes=90]` — references/mcp.md.
+- `revs.mjs --run=<id> (--pr=<n|url> | --branch=<name|sha> [--base=develop]) [--accept-behind=merge-base|merge-ref] [--no-fetch] [--json]` — pins A (the target branch's tip) and B (the head) after the up-to-date check; exit 3 when the branch is behind (nothing pinned), 2 on an error. `references/builds.md`.
+- `fingerprint.mjs --run=<id> [--sides=A,B] [--target] [--json]` or `fingerprint.mjs <build dir> [--expect=<sha>]` — the commit, release string, coverage and React Compiler coverage of a build, from its files. Exit 1 on a commit mismatch, coverage or mixed commits.
+- `build.mjs --run=<id> [--targets=web,desktop] [--sides=A,B] [--profile=release|preview] [--rebuild] [--network-install] [--node=<binary>] [--slot=off]` — see SKILL.md step 3 and `references/builds.md`. Prints the steps and an estimate up front, numbers them per side (`[A 3/4] web build … (last 0:52)` … `[A 3/4] web build done in 0:53`, a heartbeat every 30 s in between; step output goes to `<clone>/.perf-ab-logs/`, never stdout), keeps the last 5 durations per step in `$PERF_AB_HOME/timings.json`, and writes `build-status.json` (side, step i/n, start, estimate, ETA, state; `interrupted` on SIGINT/SIGTERM) for `status.mjs`. Each side's state is read again when its turn comes, so an A/A run on one clone builds once.
+- `open.mjs --run=<id> --side=B [--target] [--port=9222|auto] [--headed] [--no-seed] [--minutes=90]` — references/mcp.md. Without `--port` it takes the first free port from 9222.
 - `tenv.mjs up|status|prepare|yes|screen|down` — references/emulator.md. While it waits for the Docker engine, the controller or a port it prints `waiting for … · 0:20 of 2:00` every 10 s.
 - `attr.mjs <x.cpuprofile> --run=<id> --side=A [--top=25] [--json=<f>]` — source-mapped self/inclusive time per file and function.
-- `cleanup.mjs [--clones --older-than=3 | --clone=<name> | --apps]` — list or free disk.
+- `cleanup.mjs [--clones --older-than=3 | --clone=<name> | --apps | --refs]` — list (clones, runs, lock queues) or free disk; never removes a clone in use by a live session, exploration or build. `--refs` drops the `refs/perf-ab/*` refs revs.mjs fetched.
+- `rig/locks.mjs` — the lock queues (`machine`, `clone-<name>`, `emulator`) and the clone-users registry; `PERF_AB_SLOT=off` or `--slot=off` skips the machine slot.
 - `scripts/analyze-trace.mjs <trace.json[.gz]>` — category breakdown of a DevTools trace (MCP traces too).
