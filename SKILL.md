@@ -151,9 +151,32 @@ the PR description as a hypothesis; a perf PR usually touches shared code whose 
 the author never measured.
 
 Pick targets: **web** by default; add **desktop** when the change touches desktop code, IPC,
-Electron-specific paths, or when someone asks about desktop (references/desktop.md). Pick the
-device: **synthetic** (seeded store, mocked backend: deterministic, the default) or **emulator**
-(trezor-user-env, real connect + discovery + live backends: real data, noisier; references/emulator.md).
+Electron-specific paths, or when someone asks about desktop (references/desktop.md).
+
+**Choose the device once the brief is in, with a recommendation for this change:**
+
+| | Synthetic (seeded store, mocked backend) | Emulator (trezor-user-env: real connect + discovery, live backends) |
+| --- | --- | --- |
+| Best when | the change is Suite's own code (reducers, middleware, rendering, persistence) and its cost scales with data a seed can size; the expected effect is small (under ~5 %): only identical data and backend timing let sessions separate | the change is in device communication, connect, discovery or the backend calls, or seeded state cannot reach the code path |
+| Gives | size knobs, fresh data per iteration, exact counts, calls on 1-2 % effects | real data shapes (tokens, several networks), real backend latency, responses in the order they really arrive |
+| Costs | the data is a model: what it assumes (timestamps, response order, latency, data shapes) can decide the result | Docker and a ~5.5 GB image, live network, discovery per session; backend noise in wall times (compare CPU, long tasks, counts); the workload is whatever history the seed's accounts have; first-load effects need one load per session |
+
+Good enough: **synthetic alone** when the scenario models everything the change depends on;
+**synthetic, then one emulator pass** when the result hangs on something synthetic only assumes —
+the order or timing of backend responses, real data shapes (PR #33465: whether a page's fiat rates
+land before or after the history load settles); **emulator alone** when synthetic cannot reach the
+path. An emulator pass next to a synthetic verdict shows whether it holds on real data; it rarely
+calls a small effect by itself.
+
+How to settle it depends on the permission mode, which the session's own context states (the
+system prompt, e.g. "bypass permissions mode is active", or a reminder when the mode changes):
+- **manual** (default) or **accept edits**: ask with AskUserQuestion — both options, your
+  recommendation first and marked "(Recommended)", one line each on what it buys for this change;
+- **bypass permissions** or **auto**: choose yourself and say in one line which device and why.
+
+When the context names no mode, treat it as manual and ask. Either way, write the choice into
+`run.json` (`device`; `network: live` and `emulator` for the emulator; references/emulator.md) and
+the reason into the report's caveats.
 
 ### 3. Build both sides (in the background while you write the scenario)
 
@@ -179,6 +202,7 @@ Copy `rig/templates/scenario.mjs` and `page.js` to `<run>/scenario/` and start f
 | `examples/history-load/` | store seed, mocked TrezorConnect pages, a real thunk from the bundle, IndexedDB probe, load/drain phases, idle correction, counting pass, negative control | web (desktop bundles do not export the thunk) |
 | `examples/account-switch/` | stored transactions in the seed, Node-side phases with trusted clicks (valid INP), size knob | web + desktop |
 | `examples/emulator-accounts/` | real device and live data: settings-only seed, device checks off, waiting for discovery | web + desktop, `device: emulator` |
+| `examples/emulator-history-load/` | history-load on real data: remembered device, the real thunk against live backends, one cold first load per session, rates row checked against the live rate map | web, `device: emulator` |
 
 The contract (`references/rig.md`): `seed()` before Suite finishes init, `postInit()` for mocks and
 lookups, measured `phases` that resolve when the user-visible work is done, `after()` that restores

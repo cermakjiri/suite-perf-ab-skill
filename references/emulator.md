@@ -1,10 +1,10 @@
 # Real device and real data: trezor-user-env
 
 `"device": "emulator"` makes every session use a Trezor emulator through the bridge, Suite's real
-connect → authorize → discovery flow, and (with `"network": "live"`) the production backends. Use
-it when the change is in device communication, discovery, account loading with real history, or
-when synthetic state cannot reproduce the workload. It is slower (discovery per session) and
-noisier (backend latency): compare CPU (`taskMs`), counts and INP rather than wall times.
+connect → authorize → discovery flow, and (with `"network": "live"`) the production backends.
+SKILL.md step 2 says when it is the better device, and when synthetic plus one emulator pass is
+enough. It is slower (discovery per session) and noisier (backend latency): compare CPU
+(`taskMs`), counts and INP rather than wall times.
 Verified 2026-10-13 on web and desktop with the `all all … all` seed: Suite acquired the emulated
 T3T1 (firmware 2.12.5), discovery completed in 5-8 s with 20 BTC accounts and real history.
 
@@ -57,6 +57,28 @@ nothing is host-mapped; analytics and Sentry are still answered locally.
   `wallet.discovery` is a map keyed by device whose entries reach `status: 'complete'`.
 - Real data varies per account (47 vs 2 transactions on the `all` seed): reopen the same account
   for a stable workload, or cycle with the same order on both sides.
+
+## History load on real data (examples/emulator-history-load)
+
+The real-data counterpart of `examples/history-load`, web only (it dispatches the real
+`fetchAllTransactionsForAccountThunk`, which desktop bundles do not export).
+
+- **Remember the device** in `postInit`: `@suite/device/setRememberDevice` with `remember: true`,
+  what the UI's toggle dispatches. Only remembered devices persist rows; remembering saves the
+  device, its accounts and their first pages, so wait for the target's first-page rows first.
+- **One load per session** (`k` 1, warm-up 0): Suite marks a fully loaded account
+  (`fetchStatusDetail[key].areAllTransactionsLoaded`, cleared only by `removeAccount`) and pages it
+  by 5 next time, and the global fiat-rate map, keyed by the rounded hour, already holds every rate
+  the first load fetched. Every session wipes the emulator and starts from a fresh profile, so each
+  is a cold first load and the session count is the sample (4 v 4 per CPU rate in its plan.json).
+  `valid` drops anything but a first load, such as an iteration the performance-core gate retried.
+- **The target** is the account with the most history up to `cfg.maxTxs` on `cfg.networks`;
+  `postInit` lists every account's history size. Discovery has loaded page 1, which `fetchAll` skips.
+- **The rates row** is compared with what the live map holds at each poll (the page repeats the
+  derivation of `selectHistoricRatesByTransactions`): rates can still arrive after the rows are
+  written.
+- **No paired control**: alternating injected cost needs two loads per session. Take the metric's
+  resolution from a synthetic run's control.
 
 ## Traps
 

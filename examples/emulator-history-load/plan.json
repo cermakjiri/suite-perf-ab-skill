@@ -1,0 +1,8 @@
+{
+ "passes": [
+  { "name": "counts", "role": "counts", "order": "AB", "args": { "k": 1, "rates": "1", "warmup": 0, "cfg": { "countIdb": true, "fiberStats": true } }, "purpose": "IndexedDB operations per store and React commits of one real first load per side. Instrumented: no timing claims." },
+  { "name": "emu4", "role": "timing", "order": "ABBAABBA", "args": { "k": 1, "rates": "4", "warmup": 0 }, "purpose": "One cold first load per session at 4x, 4 v 4 sessions." },
+  { "name": "emu1", "role": "timing", "order": "ABBAABBA", "args": { "k": 1, "rates": "1", "warmup": 0 }, "purpose": "One cold first load per session at 1x, 4 v 4 sessions." },
+  { "name": "more", "role": "timing", "extends": "emu4", "order": "ABBA", "optional": true, "purpose": "One more ABBA block of emu4, only when the advice says more sessions could change a verdict." }
+ ]
+}
