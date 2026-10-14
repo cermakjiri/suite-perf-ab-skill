@@ -447,8 +447,13 @@ the rest are for reading results.
   different workload. Seed one target per iteration.
 - **Suite's browser detection rejects the `HeadlessChrome` UA** and **token definitions are a
   plain fetch that hangs init** when stalled: the rig sets a normal UA and answers definitions.
-- Same transaction timestamps for every seeded account mean anything keyed by tx time sees a
-  constant-size map, not a growing one.
+- **Timestamps shared between seeded accounts let a time-keyed cache answer one iteration from
+  another.** Suite keeps historic fiat rates in one map keyed by the rounded hour: with the same
+  timestamps on every account, every load after the first finds its rates already fetched, and the
+  map never grows. PR #33465 (rates saved once a load settles): B's rates row looked complete 25 ms
+  sooner at 1x, an artifact; with hours of its own per account, both sides' rows completed ~34 ms
+  after a 20-page load (session medians 33.8-35.3 ms). The examples give every account its own
+  hours (`blockTimeOf`).
 
 ### Builds and the environment
 

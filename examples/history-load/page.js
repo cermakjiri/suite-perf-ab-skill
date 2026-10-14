@@ -99,6 +99,13 @@
 
         return out;
     };
+    // Every account has hours of its own (one transaction per hour, one block of hours per account).
+    // Suite keeps historic fiat rates in one map keyed by the rounded hour: with timestamps shared
+    // between accounts, every load after the first finds its rates fetched by an earlier load, and the
+    // map never grows. 12 h apart, 25 targets x 1,000 transactions would reach back before 2009.
+    const HOUR = 3600;
+    const T0 = 1759000000 - (1759000000 % HOUR);
+    const blockTimeOf = (acc, i) => T0 - (acc * CFG.pages * TX_PER_PAGE + i) * HOUR;
     // a realistic BTC transaction as connect returns it: 2 inputs, 2 outputs, ~1.3 KB of JSON
     const mkTx = (acc, i) => {
         const recv = i % 3 !== 0;
@@ -113,7 +120,7 @@
         return {
             type: recv ? 'recv' : 'sent',
             txid: hex('a' + String(acc).padStart(3, '0') + 'f', i, 64),
-            blockTime: 1759000000 - i * 43200,
+            blockTime: blockTimeOf(acc, i),
             blockHeight: 915000 - i,
             blockHash: hex('00000000000000000001b', i, 64),
             lockTime: 914999 - i,

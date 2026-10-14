@@ -87,6 +87,12 @@
 
         return out;
     };
+    // Every account has days of its own (12 h apart, one block per account): Suite keys historic fiat
+    // rates by the rounded hour in one map, and timestamps shared between accounts would let one
+    // account's rates answer another's. The spacing keeps the transaction list's day groups.
+    const STEP = 43200;
+    const T0 = 1759000000 - (1759000000 % 3600);
+    const blockTimeOf = (acc, i) => T0 - (acc * CFG.txs + i) * STEP;
     // a realistic BTC transaction as connect returns it: 2 inputs, 2 outputs, ~1.3 KB of JSON
     const mkTx = (acc, i) => {
         const recv = i % 3 !== 0;
@@ -101,7 +107,7 @@
         return {
             type: recv ? 'recv' : 'sent',
             txid: hex('a' + String(acc).padStart(3, '0') + 'f', i, 64),
-            blockTime: 1759000000 - i * 43200,
+            blockTime: blockTimeOf(acc, i),
             blockHeight: 915000 - i,
             blockHash: hex('00000000000000000001b', i, 64),
             lockTime: 914999 - i,
