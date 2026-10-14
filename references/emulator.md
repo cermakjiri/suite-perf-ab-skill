@@ -11,7 +11,7 @@ T3T1 (firmware 2.12.5), discovery completed in 5-8 s with 20 BTC accounts and re
 ## Setup (outside the sandbox)
 
 ```bash
-open -a Docker                                   # Docker Desktop, if it is not running
+open -g -a Docker                                # Docker Desktop, if it is not running (-g: in the background)
 node <skill>/rig/tenv.mjs up                     # container perf-ab-tenv, ports published one by one
 node <skill>/rig/tenv.mjs status                 # what answers: controller 9001, dashboard 9002, MCP 9003, bridge 21328
 node <skill>/rig/tenv.mjs up --regtest           # + regtest blockbook on 19121 (network: none + regtest coins)
@@ -79,6 +79,13 @@ The real-data counterpart of `examples/history-load`, web only (it dispatches th
   written.
 - **No paired control**: alternating injected cost needs two loads per session. Take the metric's
   resolution from a synthetic run's control.
+- **A discarded attempt costs the session**: the performance-core gate's retry is a reload, which
+  `valid` drops, so the session ends with nothing kept (4 v 3 in its pass). Delete its
+  `out/<session>.json` and run the pass again (`plan.mjs --only=<pass>`) to fill it.
+- Verified 2026-10-14 (PR #33465): with BTC and ETH enabled the `all` seed discovers 35 accounts in
+  ~5.5 s; the largest histories are BTC `legacy/0` 108 transactions (5 pages), ETH `normal/0` 96,
+  BTC `legacy/1` 51 and `normal/0` 47, with 4 global rate keys. A session takes ~35 s. Idle CPU at
+  4x is ~125 ms/s (live background traffic), so read drain CPU idle-corrected (`taskCorrMs`).
 
 ## Traps
 
@@ -90,6 +97,12 @@ The real-data counterpart of `examples/history-load`, web only (it dispatches th
   it while an exploration is open. `tenv.mjs down` and `tenv.mjs prepare` refuse while someone else
   holds it (`--force` overrides).
 - After `bridge-stop`, web Connect falls back to WebUSB until a reload: restart the session instead.
+- **Docker Desktop quit mid-plan takes every later session with it**: each one waits 90 s for the
+  controller and fails ("cannot reach ws://127.0.0.1:9001"), and the plan keeps going (an hour lost
+  on 2026-10-14). That one was ⌘Q while Docker Desktop's window had focus: its log
+  `~/Library/Containers/com.docker.docker/Data/log/host/electron-ui-console-*.log` says
+  "keyboard shortcut used: quitApp". Start it in the background (`open -g`), and when sessions
+  start failing in stage `emulator`, check `tenv.mjs status` before anything else.
 - Live backends: wall times include network latency and its variance; a backend hiccup shows as
   one slow session. More sessions, CPU metrics, and say so in the caveats.
 - Real data is not byte-identical over time (new transactions on a public seed). Run both sides in

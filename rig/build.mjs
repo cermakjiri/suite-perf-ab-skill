@@ -365,6 +365,11 @@ const buildSide = async (job, later) => {
         await step('checkout', async () => {
             git(['-c', 'core.fsmonitor=false', 'checkout', '--quiet', '--force', '--detach', sha], clone);
             if (git(['rev-parse', 'HEAD'], clone) !== sha) throw new Error(`checkout of ${sha} did not land in ${clone}`);
+            // the clone copies the main checkout's untracked files too: a stray workspace (package.json)
+            // breaks the locked install and stray sources can reach the bundle. Ignored files stay
+            // (node_modules, caches, the rig's own .perf-ab-* files).
+            const stray = git(['-c', 'core.fsmonitor=false', 'clean', '-fd', '-e', '.perf-ab-*', '-e', '.env.local*'], clone).split('\n').filter(Boolean);
+            if (stray.length) log(`   removed ${stray.length} untracked path${stray.length === 1 ? '' : 's'} inherited from the checkout (${stray.slice(0, 3).map(l => l.replace(/^Removing /, '')).join(', ')}${stray.length > 3 ? ', …' : ''})`);
             if (patch) {
                 // the variant gets its own commit: deterministic (fixed identity, the base's date), and inlined in its bundle
                 const a = await sh('git', ['-c', 'core.fsmonitor=false', 'apply', '--index', '--whitespace=nowarn', patch], { cwd: clone });

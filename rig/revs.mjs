@@ -106,12 +106,18 @@ if (args.pr) {
         log(`note: ${args.branch} is not a branch on origin — using the local ${tryGit(['rev-parse', '--verify', '--quiet', `refs/heads/${headRef}`]) ? 'branch' : 'revision'} as it is`);
     }
 }
-const baseRef = `refs/remotes/origin/${base}`;
-refspecs.unshift(`+refs/heads/${base}:${baseRef}`);
+// a base on origin is fetched; a local-only branch (a stacked, unpushed base) is taken as it is
+const baseOnOrigin = args.noFetch
+    ? !!tryGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${base}`])
+    : spawnSync('git', ['ls-remote', '--exit-code', '--heads', 'origin', base], { cwd: repo, encoding: 'utf8' }).status === 0;
+const baseLocal = !baseOnOrigin && !!tryGit(['rev-parse', '--verify', '--quiet', `refs/heads/${base}`]);
+const baseRef = baseLocal ? `refs/heads/${base}` : `refs/remotes/origin/${base}`;
+if (baseLocal) log(`note: base ${base} is not a branch on origin — using the local branch as it is`);
+else refspecs.unshift(`+refs/heads/${base}:${baseRef}`);
 
 // ------------------------------------------------------------------ fetch
 let fetchedAt = null;
-if (!args.noFetch) {
+if (!args.noFetch && refspecs.length) {
     // a parallel run fetching into the same checkout can hold a ref lock for a moment: retry once
     for (let attempt = 0; attempt < 2; attempt++) {
         // explicit refspecs only, and the user's FETCH_HEAD left alone
@@ -134,7 +140,7 @@ const behind = Number(git(['rev-list', '--count', `${head}..${tip}`], repo));
 const ahead = Number(git(['rev-list', '--count', `${tip}..${head}`], repo));
 const what = pr ? `PR #${pr.number}${pr.headRefName ? ` ${pr.headRefName}` : ''}` : String(args.branch);
 log(`${what} → ${base} · head ${short(head)} · ${ahead} commit${ahead === 1 ? '' : 's'} of its own${pr && pr.mergeable ? ` · ${pr.mergeable.toLowerCase()}` : ''}${pr && pr.draft ? ' · draft' : ''}`);
-log(`base origin/${base} @ ${short(tip)}${fetchedAt ? ' (just fetched)' : ' (not fetched: --no-fetch)'} · merge-base ${short(mergeBase)}`);
+log(`base ${baseLocal ? '' : 'origin/'}${base} @ ${short(tip)}${baseLocal ? ' (local branch)' : fetchedAt ? ' (just fetched)' : ' (not fetched: --no-fetch)'} · merge-base ${short(mergeBase)}`);
 if (!ahead) fail(`${what} has no commits on top of origin/${base}: nothing to compare (merged already, or the wrong branch?)`);
 
 // ------------------------------------------------------------------ what moved on the target
