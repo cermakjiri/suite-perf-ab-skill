@@ -225,7 +225,11 @@ Rules that keep a scenario honest:
 Prototype the in-page part against a live build before the first timing pass: `open.mjs` keeps one
 side open on CDP :9222 with the scenario loaded, and the MCPs attach to it (references/mcp.md):
 the Playwright MCP for testids and `browser_evaluate` of `window.__A.phases.x(…)`, the
-chrome-devtools-electron MCP for a trace or a heap snapshot. **Never take a timing number from an
+chrome-devtools-electron MCP for a trace or a heap snapshot. A Suite that answers
+`devtoolstooldiscovery` (references/discovery.md) lists its own tools there
+(`list_3p_developer_tools`: `suite.ready`, `suite.goto`, `suite.thunk`, `suite.seed`, …);
+`window.__H.tool(name, args)` runs the same tools from a scenario, and `goto`, `thunk`,
+`suiteReady`, `connect` prefer them on their own — with or without them, the scenario reads the same. **Never take a timing number from an
 MCP-attached page**: the DevTools MCP turns the V8 debugger on, which makes array spreads ~25x
 slower (the env canary shows it: spread/slice ≈ 1 normal, ≈ 25 attached).
 
@@ -282,7 +286,9 @@ Before believing a delta:
   build can read lower). If it did not, the metric cannot see this workload.
 - **Env per side**: the `build` line (this side's commit ✓, the profile), `coverageFiles` 0, React
   renderers 1, calibration 4x ≈ 4× 1x, the canary ≈ 1, and the performance-core line (waits,
-  discards, E share, P clock). `aggregate.mjs` refuses a side whose sessions ran two builds.
+  discards, E share, P clock). `aggregate.mjs` refuses a side whose sessions ran two builds, and
+  warns when the sides offer different page tools (the change touches Suite's automation tools:
+  the rig used its own helpers where a tool was missing — say so in the caveats).
 - **Window length**: when one side's phase lasts much longer (a drain), compare `taskCorrMs`
   (idle-corrected) and the counts, not raw totals or percentiles over the window.
 - A delta with no mechanism in the diff gets attributed before it is reported: `--profile-at=3` on
@@ -333,6 +339,7 @@ sessions from two deployments. Previews are `preview`-profile builds (redux-logg
 | `references/desktop.md` | Any desktop target: launch, isolation, IPC, routing, what differs from web |
 | `references/emulator.md` | `device: emulator`, the `trezor-emulator` MCP, real data |
 | `references/mcp.md` | Exploring a build with the Playwright / chrome-devtools(-electron) MCPs, traces, heap snapshots |
+| `references/discovery.md` | A Suite that answers `devtoolstooldiscovery`: the tool contract, what `__H` prefers, the per-side check |
 | `references/problem-classes.md` | Step 2 (diff → suspects) and checking coverage in the report |
 | `references/house-rules.md` | Step 2 rule scan, and citing the fix in the report |
 | `references/seeding.md` | Store seeding: the `@storage/load` payload, gates, account shape |

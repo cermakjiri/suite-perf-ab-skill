@@ -166,6 +166,8 @@ const buildText = k => {
 
     return `${proof}${rel}${prof}${s.url ? ` · ${s.url}` : ''}`;
 };
+// page-provided tools (devtoolstooldiscovery, references/discovery.md), as the first session saw them
+const toolsText = t => (t && t.found ? t.groups.map(g => `${g.name}${g.description ? ` — ${g.description}` : ''}: ${g.tools.join(', ')}`).join('; ') : 'none (no devtoolstooldiscovery answer)');
 const sideCard = (k, i) => {
     const s = S.run.sides[k];
     const f = firstSession(k) || {};
@@ -186,7 +188,8 @@ const sideCard = (k, i) => {
 <dt>sessions</dt><dd>${sessionsOf(k).length} (${sessionsOf(k).filter(x => x.complete).length} complete)</dd>
 ${markers ? `<dt>code markers</dt><dd>${markers}</dd>` : ''}
 <dt>coverage files</dt><dd>${env.coverageFiles ?? '–'}</dd>
-<dt>React renderers</dt><dd>${env.renderers ?? '–'}${env.desktopLaunches > 1 ? ` (desktop: ${env.desktopLaunches} launches)` : ''}</dd>
+<dt>React renderers</dt><dd>${env.renderers ?? '–'}${env.desktopLaunches > 1 ? ` (desktop: ${env.desktopLaunches} launches)` : ''}${env.pageHook && env.pageHook.installed && !env.hook ? " (commits from the page's early hook)" : ''}</dd>
+<dt>page tools</dt><dd>${esc(toolsText(env.discovery))}</dd>
 <dt>calibration loop</dt><dd>${esc(cal)}${ratio ? ` → ${ratio}x` : ''}</dd>
 <dt>idle CPU</dt><dd>${esc(idle)}</dd>
 <dt>debugger canary</dt><dd>${canary ? `spread/slice ${canary} (≈1 = no debugger)` : '–'}</dd>
@@ -235,9 +238,13 @@ const compilerDiffers = (() => {
 
     return t.every(x => typeof x === 'number') && new Set(t).size > 1;
 })();
+// page-provided tools (devtoolstooldiscovery, references/discovery.md): the sides must offer the same contract
+const sideTools = sideKeys.map(k => toolsText(S.run.sides[k].tools));
+const toolsCaveat = sideTools.length > 1 && new Set(sideTools).size > 1 ? `The sides offer different page tools (${sideKeys.map((k, i) => `${esc(k)}: ${esc(sideTools[i])}`).join('; ')}): the change touches Suite's automation tools; where a tool was missing the rig used its own helpers.` : null;
 const autoCaveats = [
     baseCaveat,
     profileCaveat,
+    toolsCaveat,
     S.run.device === 'synthetic' ? 'Synthetic state: seeded store and mocked backend, identical on both sides; no device and no network.' : `Device: ${esc(S.run.device)} (trezor-user-env emulator) — real connect flow; backend latency adds noise to wall times, CPU totals are less affected.`,
     'Percentiles pool iterations from several page sessions; iterations inside a session are correlated, so the session columns decide whether a timing difference is real.',
     `One machine${loads.length ? `, 1-min load average ${Math.min(...loads)}–${Math.max(...loads)} at session starts` : ''}; numbers do not transfer to other hardware, only the direction and the session separation do.`,
@@ -265,11 +272,11 @@ ${verdicts.length ? `<section><h2>Verdict</h2>${verdictCards(verdicts)}</section
 ${N.findings && N.findings.length ? `<section><h2>Findings</h2><ul>${N.findings.map(f => `<li>${f}</li>`).join('')}</ul></section>` : ''}
 ${(N.sections || []).map(s => `<section><h2>${esc(s.title)}</h2>${s.html}</section>`).join('\n')}
 ${passSections}
-<section><h2>Builds and rig health</h2>${placementFlags.length ? `<div class="callout"><p><b>Efficiency-core placement differs between the sides.</b> ${placementFlags.map(f => esc(`${passLabel(f.pass)} @ ${f.rate}x: ${f.text}.`)).join(' ')}</p></div>` : ''}<div class="sidecards">${sideKeys.map(sideCard).join('')}</div>
+<section><h2>Builds and rig health</h2>${placementFlags.length ? `<div class="callout"><p><b>Efficiency-core placement differs between the sides.</b> ${placementFlags.map(f => esc(`${passLabel(f.pass)} @ ${f.rate}x: ${f.text}.`)).join(' ')}</p></div>` : ''}${S.warnings && S.warnings.length ? `<div class="callout"><p><b>Aggregate warnings.</b> ${S.warnings.map(w => esc(w)).join(' · ')}</p></div>` : ''}<div class="sidecards">${sideKeys.map(sideCard).join('')}</div>
 ${compilerDiffers ? `<div class="callout"><p><b>The sides differ in React Compiler coverage.</b> ${sideKeys.map(k => esc(`${k}: ${compilerText(S.run.sides[k].fingerprint.compiler, 4)}`)).join(' · ')}. Manual memoization reads differently on each side: redundant where compiled, the only mechanism where not.</p></div>` : ''}
 <p class="note">Every Suite bundle inlines the commit it was built from (COMMITHASH and the release string): the build's fingerprint checks it against the clone, and every session found its own side's commit and no other side's in the loaded modules — no hand-picked marker needed. React Compiler coverage counts the compiler's memo blocks (<code>react.memo_cache_sentinel</code>), mapped to source files through the source maps. The calibration loop is a fixed busy loop per CPU rate (the higher rate should read about that many times slower). The spread/slice canary reads about 1 without a debugger and about 25 when a DevTools debugger taxes spreads.</p>
 ${S.advice && S.advice.next && S.advice.next.length ? `<p class="note">Could more sessions change a verdict? ${(S.advice.controls || []).filter(c => c.state && c.state !== 'failed').map(c => esc(controlText(c, `${c.pass} @ ${c.rate}x`))).concat(S.advice.next.map(esc)).join(' · ')}</p>` : ''}</section>
-<section><h2>Caveats</h2><ul>${autoCaveats.concat(N.caveats || []).map(c => `<li>${c}</li>`).join('')}</ul></section>
+<section><h2>Caveats</h2><ul>${autoCaveats.concat(N.caveats || []).filter(Boolean).map(c => `<li>${c}</li>`).join('')}</ul></section>
 <section><h2>Method</h2><ul>
 <li>Each session is one fresh ${S.run.target === 'desktop' ? 'Electron app launch (own user-data dir, wiped at start)' : 'headless Chromium page'} serving a local production build; sessions alternate ${esc(sideKeys.join('/'))} in ABBA order.</li>
 <li>Per CPU rate: a calibration loop, a ${esc(((S.passes[mainPass] && S.passes[mainPass].meta && S.passes[mainPass].meta.idleMs) || 10000) / 1000)}-second idle window (background CPU per second), then k iterations of a two-spin warm-up and the measured phases <code>${esc((scenario.phases || []).map(p => (typeof p === 'string' ? p : p.name)).join(' → '))}</code>.</li>

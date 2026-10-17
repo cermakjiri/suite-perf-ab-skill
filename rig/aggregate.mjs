@@ -157,7 +157,7 @@ for (const passName of passes) {
         loaded.push(Object.assign({ d }, s));
         const c = sessionCommit(d);
         if (c) ((ranOn[s.side] ||= {})[c] ||= []).push(s.file.replace(/\.json$/, ''));
-        (P.sessions[s.side] = P.sessions[s.side] || []).push({ id: s.file.replace(/\.json$/, ''), complete: !!d.complete, iterations: d.runs.length, started: d.meta.started, load: d.meta.host && d.meta.host.load, browser: d.meta.browser, env: d.env && { markers: Object.fromEntries(Object.entries(d.env.markers || {}).filter(([n]) => !/^[0-9a-f]{40}$/.test(n))), coverageFiles: d.env.coverageFiles, renderers: d.env.renderers, canary: d.env.canary, desktopLaunches: d.env.desktopLaunches, build: d.env.build || null }, commit: sessionCommit(d), calib: d.calib, idle: Object.fromEntries(Object.entries(d.idle || {}).map(([r, i]) => [r, { taskPerS: i.ms ? +(i.taskMs / (i.ms / 1000)).toFixed(1) : null, commits: i.commits }])), pcore: d.meta.pcore ? { enabled: d.meta.pcore.enabled, reason: d.meta.pcore.reason, waitMs: d.meta.pcore.gateWaitMs, discards: d.meta.pcore.discards.length, kept: d.meta.pcore.kept.length } : null, error: d.error || null });
+        (P.sessions[s.side] = P.sessions[s.side] || []).push({ id: s.file.replace(/\.json$/, ''), complete: !!d.complete, iterations: d.runs.length, started: d.meta.started, load: d.meta.host && d.meta.host.load, browser: d.meta.browser, env: d.env && { markers: Object.fromEntries(Object.entries(d.env.markers || {}).filter(([n]) => !/^[0-9a-f]{40}$/.test(n))), coverageFiles: d.env.coverageFiles, renderers: d.env.renderers, canary: d.env.canary, desktopLaunches: d.env.desktopLaunches, build: d.env.build || null, discovery: d.env.discovery || null, pageHook: d.env.pageHook || null }, commit: sessionCommit(d), calib: d.calib, idle: Object.fromEntries(Object.entries(d.idle || {}).map(([r, i]) => [r, { taskPerS: i.ms ? +(i.taskMs / (i.ms / 1000)).toFixed(1) : null, commits: i.commits }])), pcore: d.meta.pcore ? { enabled: d.meta.pcore.enabled, reason: d.meta.pcore.reason, waitMs: d.meta.pcore.gateWaitMs, discards: d.meta.pcore.discards.length, kept: d.meta.pcore.kept.length } : null, error: d.error || null });
         if (!P.meta) P.meta = { k: d.meta.k, rates: d.meta.rates, warmup: d.meta.warmup, idleMs: d.meta.idleMs, cfg: d.meta.cfg, altInject: d.meta.altInject, target: d.meta.target, device: d.meta.device, scenario: d.meta.scenario };
     }
     P.role = roleOf(passName, P.meta);
@@ -266,6 +266,18 @@ if (mixed.length) {
     }
     warnings.push(...mixed.map(m => `mixed builds pooled (--allow-mixed-builds): ${m}`));
 }
+
+// ------------------------------------------------------------------ page tools
+// page-provided tools (devtoolstooldiscovery, references/discovery.md): the sides must offer the same contract
+const toolsOf = k => {
+    for (const p of Object.values(summary.passes)) for (const s of p.sessions[k] || []) if (s.env && s.env.discovery) return s.env.discovery;
+
+    return null;
+};
+const toolsText = t => (t && t.found ? t.groups.map(g => `${g.name}${g.description ? ` (${g.description})` : ''}: ${g.tools.slice().sort().join(', ')}`).join('; ') : 'none');
+for (const [k, side] of Object.entries(summary.run.sides)) side.tools = toolsOf(k);
+const toolTexts = Object.entries(summary.run.sides).map(([k, s]) => [k, toolsText(s.tools)]);
+if (toolTexts.length > 1 && new Set(toolTexts.map(x => x[1])).size > 1) warnings.push(`the sides offer different page tools (devtoolstooldiscovery): ${toolTexts.map(([k, v]) => `${k} → ${v}`).join(' | ')} — the change touches Suite's automation tools; where a tool was missing the rig used its own helpers`);
 
 // ------------------------------------------------------------------ advice
 // Could more sessions change a verdict? Per timing pass x rate (2+ sessions a side), every timing
@@ -460,5 +472,6 @@ for (const [k, side] of Object.entries(summary.run.sides)) {
     const c = side.commit || sideCommit(run.sides[k]);
     console.log(`build ${k}: ${c ? c.slice(0, 10) : 'commit unknown'}${side.url ? ` (preview ${side.url})` : ''}${side.profile ? ` · ${side.profile}` : ''}${fp && fp.release ? ` · ${fp.release.version}.${fp.release.suiteType}${fp.release.codesign ? '.codesign' : ''}` : ''} · compiler: ${fp ? compilerText(fp.compiler, 4) : '–'}`);
 }
+for (const [k, side] of Object.entries(summary.run.sides)) if (side.tools) console.log(`tools ${k}: ${toolsText(side.tools)}`);
 if (summary.run.base && summary.run.base.behind) console.log(`base: B was ${summary.run.base.behind} commits behind origin/${summary.run.base.branch} when pinned, measured as ${summary.run.base.mode}`);
 console.log(`\nsummary: ${outFile}`);

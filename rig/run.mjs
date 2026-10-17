@@ -281,6 +281,9 @@ const session = async () => {
         sideLog(`ready ${Date.now() - t0} ms after seeding${L.launches && L.launches() > 1 ? ` (desktop: ${L.launches()} launches until the probes caught the first load)` : ''}`);
         out.post = await ev(() => (window.__A.postInit ? window.__A.postInit() : null));
         sideLog('postInit', JSON.stringify(out.post).slice(0, 400));
+        // page-provided tools (devtoolstooldiscovery, references/discovery.md): asked once here, lazily by the helpers that prefer them
+        out.tools = await ev(() => window.__H.discover());
+        sideLog('tools', out.tools && out.tools.found ? out.tools.groups.map(g => `${g.name}${g.description ? ` (${g.description})` : ''}: ${g.tools.join(', ')}`).join('; ') : 'none (the page answered no devtoolstooldiscovery)');
         const ctxBase = { page, cdp, context: L.context, cfg, side, target, ev };
         if (scenario.nodeSetup) await scenario.nodeSetup(ctxBase);
         if (scenario.route) sideLog('route', await ev(r => window.__H.goto(r.name, r.params), typeof scenario.route === 'string' ? { name: scenario.route } : scenario.route));
@@ -291,7 +294,13 @@ const session = async () => {
         out.env.desktopLaunches = L.launches ? L.launches() : null;
         sideLog('env', JSON.stringify(Object.assign({}, out.env, { verify: undefined, support: undefined, build: undefined })));
         if (out.env.coverageFiles !== 0 && !args.allowCoverage) fail(`build is coverage-instrumented (${out.env.coverageFiles} files) — not comparable; rebuild without INSTRUMENT_CODE`);
-        if (!out.env.hook || out.env.renderers < 1) fail('React hook did not install before react-dom (commit counts would read 0)');
+        // React commits: react-dom registered with the init script's hook; else the hook wrapped one that was
+        // already there (the page's early hook: every commit passes through from then on); else the page's own
+        // count (suite.perf) when Suite ships one
+        const pageHook = !!(out.env.pageHook && out.env.pageHook.installed && (out.env.pageHook.renderers == null || out.env.pageHook.renderers >= 1));
+        const ownHook = !!(out.env.hook && out.env.renderers >= 1);
+        if (!ownHook && !out.env.hookWrapped && !pageHook) fail('React hook did not install before react-dom (commit counts would read 0)');
+        if (!ownHook) sideLog(`React commits counted ${out.env.hookWrapped ? "through the page's own early hook, wrapped after a late injection" : "by the page's own early hook (suite.perf)"}: the init script's hook was late`);
         // which build ran: this side's commit in the loaded modules, and no other side's
         const b = out.env.build || {};
         const foreign = FOREIGN.filter(c => out.env.markers[c] > 0 || b.commit === c);

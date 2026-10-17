@@ -159,7 +159,8 @@ unresolvable; desktop: Electron on the side's app dir with its own profile, rela
 script missed the first load — references/desktop.md) → init
 script `window.Playwright = true; __CFG; __RUN; rig/page/core.js; <scenario page.js>` → wait
 `__A.ready()` → `__A.seed()` → wait `__A.isReady()` (default: Suite lifecycle ready, router
-loaded, no loading screen) → `__A.postInit()` → `scenario.nodeSetup(ctx)` → `__H.goto(route)` →
+loaded, no loading screen) → `__A.postInit()` → `__H.discover()` (the page's tools, logged; references/discovery.md) →
+`scenario.nodeSetup(ctx)` → `__H.goto(route)` →
 env checks (coverage 0, React hook installed before react-dom; the build: this side's commit
 present in the loaded modules and no other side's, the release string's commit and codesign flag
 matching the side — `env.build` = { commit, release, modules, sentinelModules, expected, verified:
@@ -330,7 +331,8 @@ per rate (`ready`) and the renderer's normal priority per target (`pri`). `--max
 
 ```js
 { meta: { run, side, label, rev, sha, buildSha, variant, profile, build, target, device, network, slot, scenario, cfg, k, rates, warmup, idleMs, altInject, host, browser, started, finished, timing: { …, queueMs } },
-  complete, env: { coverageFiles, hook, renderers, markers, build, canary, ua, dpr, inner, store, connect, sentry, verify, desktopLaunches, ... },
+  complete, env: { coverageFiles, hook, renderers, markers, build, canary, ua, dpr, inner, store, connect, sentry, verify, desktopLaunches, discovery: { found, groups }, pageHook, ... },
+  tools: { found, groups: [ { name, description, tools: [names] } ] },
   seed, post, calib: { <rate>: [ms x5] }, idle: { <rate>: { ms, taskMs, commits, ... } },
   runs: [ { rate, iter, n, inject, load1m, before, phases: { <name>: <phase record> }, after, problem } ],
   end, hits: { served, missing, definitions, telemetry, aborted }, diag: [console errors/warnings] }
@@ -371,7 +373,11 @@ most thunks module-internal), `exportsOf(id)`, `markers(needles)`, `click(testid
 `settings-index`, `wallet-index`), `routeName()`,
 `suiteReady()`, `waitFor(fn, { timeout, label })`, `settle(ms)`, `sleep`, `nextFrame`, `spin`,
 `busy(n)` (the ready check's fixed spin), `warm()`, `injectCost()`, `probes.start/stop/stats(from,
-to)`, `runPhase`, `windowStart/End`, `idleWindow`, `calib`, `env`, and the discard protocol:
+to)`, `runPhase`, `windowStart/End`, `idleWindow`, `calib`, `env`; the page's own tools when
+Suite answers `devtoolstooldiscovery` (references/discovery.md): `discover()`, `tool(name, args)`,
+`hasTool`, `syncTool`, `tools()`, `thunk(typePrefix)` (`arg => Promise<resolved action>` through
+`suite.thunk`, else the bundle's export) — `goto`, `suiteReady` and `connect` prefer the page's
+tool and keep their previous way as the fallback; and the discard protocol:
 `abort(reason)` (ends the running phase; `sleep`, `settle`, `waitFor` and `injectCost` throw at
 their next step), `drainAborted(ms)` (waits for the aborted work to finish) and `clearAbort()`.
 

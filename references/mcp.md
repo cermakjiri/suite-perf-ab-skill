@@ -7,7 +7,7 @@ drive device prompts. Timing comes from `run.mjs` / `plan.mjs` only.
 | MCP | Attaches to | Use it for |
 | --- | --- | --- |
 | `playwright` (`playwright mcp --cdp-endpoint=http://127.0.0.1:9222`) | whatever listens on :9222 | `browser_snapshot` (roles, testids, refs), `browser_click`/`type` (trusted input), `browser_evaluate` / `browser_run_code_unsafe` to run `window.__A.phases.x({ n: 0 })` against the live app |
-| `chrome-devtools-electron` (`chrome-devtools-mcp --browserUrl http://127.0.0.1:9222`) | whatever listens on :9222 — web or Electron | `evaluate_script`, `performance_start_trace` / `stop_trace` (+ insights), `take_heapsnapshot`, `list_console_messages` (preserved over 3 navigations) |
+| `chrome-devtools-electron` (`chrome-devtools-mcp --browserUrl http://127.0.0.1:9222 --categoryExperimentalThirdParty=true`) | whatever listens on :9222 — web or Electron | `evaluate_script`, `performance_start_trace` / `stop_trace` (+ insights), `take_heapsnapshot`, `list_console_messages` (preserved over 3 navigations), `list_3p_developer_tools` / `execute_3p_developer_tool` (the page's own tools, below) |
 | `chrome-devtools` | its own Chrome | quick looks at deployed previews; never for timing |
 | `trezor-emulator` (SSE :9003) | trezor-user-env | emulator screen, yes/no/swipe (references/emulator.md) |
 
@@ -28,6 +28,27 @@ another run's timing session, which the performance-core gate waits out or disca
 Web uses a persistent Chromium profile (`profiles/<run>-web-<side>`) — the browser's default
 context, the only one CDP clients see. On desktop the window loads before the init script can be registered on a fixed port, so the
 probes are injected after boot (no React commit counts in that session).
+
+## Page-provided tools (`devtoolstooldiscovery`)
+
+With `--categoryExperimentalThirdParty=true`, the DevTools MCP asks the page for tools: it
+dispatches a `devtoolstooldiscovery` event on `window` and lists whatever the page's listener
+passes to `event.respondWith(toolGroup)`. A Suite that ships the automation tools
+(references/discovery.md; the Suite-side plan is `plans/suite-devtools-discovery.md`) answers with
+group `suite`: `suite.ready`, `suite.goto`, `suite.thunk`, `suite.seed`, `suite.state`,
+`suite.testIds`, `suite.find` … The gate is the one the rig already sets: `window.Playwright`
+on web (the init script), `--expose-store` on desktop; an ungated page has no listener and
+`list_3p_developer_tools` says so.
+
+- `list_3p_developer_tools` prints every tool with its JSON schema; `execute_3p_developer_tool`
+  validates the arguments and runs one. A tool that returns an element (`suite.find`) gives a uid
+  that `click` accepts — trusted input, so Event Timing sees it.
+- Results that must stay live (`suite.services` → the TrezorConnect object to mock a method on):
+  `evaluate_script` with `window.__dtmcp.executeTool(name, params)`.
+- The same tools serve the rig without the MCP: `window.__H.tool(name, args)` in a scenario,
+  and `goto`, `thunk`, `suiteReady`, `connect` prefer them on their own. Prototype a phase in
+  the open session with the MCP, keep the `__H.tool` calls in page.js.
+- A page tool is still page code: a trace or a timing through the MCP stays off-limits.
 
 ## Facts that cost time when unknown
 

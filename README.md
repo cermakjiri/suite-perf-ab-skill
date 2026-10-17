@@ -40,7 +40,9 @@ It is tool-agnostic: the same folder works in **Claude Code** and in **GitHub Co
 - Lets several runs share one machine: measured sessions and heavy build steps take turns, one at a
   time across all runs; clones, the emulator and the CDP port are guarded.
 - Optional: keeps one side open on CDP :9222 for the **Playwright MCP** and the
-  **chrome-devtools(-electron) MCP** to explore, trace and heap-snapshot (never to time).
+  **chrome-devtools(-electron) MCP** to explore, trace and heap-snapshot (never to time). A Suite
+  that answers the MCP's `devtoolstooldiscovery` event lists its own automation tools there, and
+  the rig uses the same tools from Playwright (`references/discovery.md`).
 
 ## What it will not do
 
@@ -119,12 +121,14 @@ CDP `127.0.0.1:9222`:
 
 ```bash
 claude mcp add playwright -- <trezor-suite>/node_modules/.bin/playwright mcp --cdp-endpoint=http://127.0.0.1:9222
-claude mcp add chrome-devtools-electron -- npx chrome-devtools-mcp@latest --browserUrl http://127.0.0.1:9222
+claude mcp add chrome-devtools-electron -- npx chrome-devtools-mcp@latest --browserUrl http://127.0.0.1:9222 --categoryExperimentalThirdParty=true
 claude mcp add --transport sse trezor-emulator http://127.0.0.1:9003/sse     # served by trezor-user-env
 ```
 
 The DevTools MCP enables the V8 debugger on every page it attaches to (array spreads ~25x slower),
-so numbers are never taken from an MCP-attached page.
+so numbers are never taken from an MCP-attached page. `--categoryExperimentalThirdParty=true` turns
+on `list_3p_developer_tools` / `execute_3p_developer_tool`: the tools a page offers through the
+`devtoolstooldiscovery` event (Suite-side plan: `plans/suite-devtools-discovery.md`).
 
 ---
 
@@ -175,7 +179,7 @@ and the method. The run folder keeps every session's raw JSON, so any number can
 | `examples/` | worked scenarios: `history-load` (web, store seed + mocked backend + real thunk), `account-switch` (web + desktop, trusted clicks), `emulator-accounts` (real device and data) |
 | `references/rig.md` | every script's flags, run.json / plan.json / scenario contract, outputs, metric names |
 | `references/builds.md` | the pair and the rebase gate, the build recipe and profiles, the commit proof, React Compiler coverage, parallel runs, build-config changes weighed |
-| `references/desktop.md`, `emulator.md`, `mcp.md` | the desktop target, trezor-user-env, exploring with the MCPs |
+| `references/desktop.md`, `emulator.md`, `mcp.md`, `discovery.md` | the desktop target, trezor-user-env, exploring with the MCPs, the page-provided tool contract |
 | `references/problem-classes.md`, `house-rules.md` | diff → suspects → scenarios; fixes cited from Suite's own rules |
 | `references/seeding.md`, `pitfalls.md` | store seeding; every trap that produced a wrong answer once |
 | `scripts/analyze-trace.mjs` | DevTools trace category breakdown (works on MCP traces) |

@@ -8,8 +8,10 @@
  * hook, and a late hook reads every commit count as zero, silently.
  *
  * window.__perf  raw probe data (commits, long tasks, LoAF entries)
- * window.__H     helpers for the scenario (store, webpack lookups, routing, waiting, warm-up) and
- *                the measurement wrappers the runner calls (runPhase, idleWindow, calib, env)
+ * window.__H     helpers for the scenario (store, webpack lookups, routing, waiting, warm-up), the
+ *                page's own tools when Suite answers devtoolstooldiscovery (discover, tool, thunk —
+ *                references/discovery.md) and the measurement wrappers the runner calls
+ *                (runPhase, idleWindow, calib, env)
  *
  * Probes that stay on for the whole session are cheap and identical on both sides: one timestamp
  * per React commit, buffered long-task / long-animation-frame observers. The rAF frame and 10 ms
@@ -183,6 +185,97 @@
         }
     };
 
+    // ------------------------------------------------------------ page-provided tools
+    // Suite can answer chrome-devtools-mcp's `devtoolstooldiscovery` event with tool groups
+    // (references/discovery.md). The rig asks exactly as the MCP does — a CustomEvent on window
+    // with a respondWith callback — so one app-side contract serves MCP exploration and Playwright
+    // measurement alike. A page without the listener (an ungated build, a Suite without the tools)
+    // answers nothing, and every helper that prefers a tool falls back to the rig's own way.
+    const disc = { groups: [], exec: new Map(), found: false };
+    const takeGroups = groups => {
+        disc.groups = groups;
+        disc.exec = new Map();
+        for (const g of groups) for (const t of g.tools || []) if (t && typeof t.name === 'string' && typeof t.execute === 'function' && !disc.exec.has(t.name)) disc.exec.set(t.name, t);
+        disc.found = groups.length > 0;
+    };
+    const ask = () => {
+        const groups = [];
+        const event = new CustomEvent('devtoolstooldiscovery');
+        event.respondWith = group => {
+            if (group && typeof group.name === 'string' && Array.isArray(group.tools)) groups.push(group);
+        };
+        try {
+            window.dispatchEvent(event);
+        } catch {
+            // a listener threw: no answer
+        }
+
+        return groups;
+    };
+    // synchronous answers only; asks again on later calls while nothing has answered (Suite registers
+    // its listener during init, after this script ran)
+    const ensureDiscovered = () => {
+        if (disc.found) return;
+        const groups = ask();
+        if (groups.length) takeGroups(groups);
+    };
+    const discoverySummary = () => ({
+        found: disc.found,
+        groups: disc.groups.map(g => ({ name: g.name, description: typeof g.description === 'string' ? g.description : null, tools: (g.tools || []).map(t => t && t.name).filter(Boolean) })),
+    });
+    /** Ask the page for its tools (with the MCP's one tick of grace for asynchronous answers). */
+    const discover = async opts => {
+        const refresh = !!(opts && opts.refresh);
+        if (disc.found && !refresh) return discoverySummary();
+        const groups = ask();
+        if (!groups.length) await rawSleep(0);
+        if (groups.length || refresh) takeGroups(groups);
+
+        return discoverySummary();
+    };
+    const hasTool = name => {
+        ensureDiscovered();
+
+        return disc.exec.has(name);
+    };
+    /** Run a page tool in-page: live objects come back live, a promise is awaited. Throws when the page does not offer it. */
+    const tool = async (name, args) => {
+        checkAbort();
+        if (!hasTool(name)) await discover();
+        const t = disc.exec.get(name);
+        if (!t) throw new Error(`page tool ${name} not found${disc.found ? ` (the page offers: ${[...disc.exec.keys()].join(', ')})` : ' (the page answered no devtoolstooldiscovery: an ungated build, or a Suite without the tools)'}`);
+
+        return t.execute(args || {});
+    };
+    /** A tool whose contract is a synchronous answer: undefined when absent, when it threw, or when it answered with a promise. */
+    const syncTool = (name, args) => {
+        if (!hasTool(name)) return undefined;
+        let r;
+        try {
+            r = disc.exec.get(name).execute(args || {});
+        } catch {
+            return undefined;
+        }
+
+        return r && typeof r.then === 'function' ? undefined : r;
+    };
+    // The rig's hook sees commits when react-dom registered with it (renderers ≥ 1) or when it wrapped a
+    // hook that was already there (the page's early hook, after a late injection): from then on every
+    // commit passes through it. Otherwise the page's own count (suite.perf), when Suite offers one.
+    const ownHookCounts = () => P.renderers >= 1 || P.wrapped;
+    /** React commits in a window: the rig's own hook, else the page's early hook (suite.perf). */
+    const commitsIn = (from, to) => {
+        if (ownHookCounts()) return P.commits.filter(t => t >= from && t < to).length;
+        const r = syncTool('suite.perf', Number.isFinite(from) && Number.isFinite(to) ? { action: 'read', from, to } : { action: 'read' });
+
+        return r && typeof r.commits === 'number' ? r.commits : 0;
+    };
+    const pageHook = () => {
+        const r = syncTool('suite.perf', { action: 'read' });
+
+        return r && typeof r === 'object' ? { installed: !!r.installed, renderers: r.renderers ?? null, commits: r.commits ?? null } : null;
+    };
+
     // ------------------------------------------------------------ window probes
     // rAF deltas (frames over budget) and the lateness of a 10 ms timer chain (how long input would
     // have waited at a random moment). On only inside measured windows, alike on both sides.
@@ -227,7 +320,7 @@
         const sh = inRange(P.shifts, from, to);
 
         return {
-            commits: P.commits.filter(t => t >= from && t < to).length,
+            commits: commitsIn(from, to),
             frames: f.length,
             frameP50: pct(f, 50),
             frameP95: pct(f, 95),
@@ -391,6 +484,13 @@
     const connect = () => {
         if (window.TrezorConnect) return window.TrezorConnect;
         if (connectCache) return connectCache;
+        // the page's own tool first: desktop has no window.TrezorConnect and the bundle walk is a heuristic
+        const fromPage = syncTool('suite.services', { name: 'connect' });
+        if (fromPage && typeof fromPage.getAccountInfo === 'function') {
+            connectCache = fromPage;
+
+            return fromPage;
+        }
         if (!wr()) return null;
         const ids = findModules('initIpcProxy').concat(findModules('blockchainGetAccountBalanceHistory'));
         for (const id of ids) {
@@ -429,22 +529,42 @@
         'wallet-index': p => p && `@account-menu/${p.symbol}/${p.accountType || 'normal'}/${p.accountIndex || 0}`,
     };
     const routeName = () => state().router && state().router.route && state().router.route.name;
-    /** Suite navigation: its own @router/goto thunk (web), else the matching menu click (desktop). */
+    /** Suite navigation: the page's suite.goto tool, else its @router/goto thunk (web), else the matching menu click (desktop). */
     const goto = async (name, params, ms) => {
-        const thunk = findThunk('@router/goto');
-        if (thunk) {
-            dispatch(thunk({ routeName: name, params }));
-        } else {
-            const testid = MENU[name] && MENU[name](params);
-            if (!testid) throw new Error(`@router/goto is not exported by this bundle and ${name} has no menu fallback — click through the UI in the scenario`);
-            click(testid);
+        await discover();
+        if (hasTool('suite.goto')) {
+            await tool('suite.goto', { routeName: name, params });
             await waitFor(() => routeName() === name, { timeout: 15000, label: `route ${name}` });
+        } else {
+            const gotoThunk = findThunk('@router/goto');
+            if (gotoThunk) {
+                dispatch(gotoThunk({ routeName: name, params }));
+            } else {
+                const testid = MENU[name] && MENU[name](params);
+                if (!testid) throw new Error(`@router/goto is not exported by this bundle and ${name} has no menu fallback — click through the UI in the scenario`);
+                click(testid);
+                await waitFor(() => routeName() === name, { timeout: 15000, label: `route ${name}` });
+            }
         }
         await settle(ms == null ? 300 : ms);
 
         return routeName();
     };
+    /**
+     * A callable for an RTK thunk by type prefix: the page's suite.thunk tool when it offers one
+     * (desktop bundles keep most thunks module-internal), else the bundle's export. Returns
+     * `arg => Promise<resolved action>`, or null when neither finds it.
+     */
+    const thunk = typePrefix => {
+        if (hasTool('suite.thunk')) return arg => tool('suite.thunk', { typePrefix, arg });
+        const fn = findThunk(typePrefix);
+
+        return fn ? arg => dispatch(fn(arg)) : null;
+    };
     const suiteReady = () => {
+        // the page's own answer when it offers one (synchronous by contract), else the store
+        const r = syncTool('suite.ready', {});
+        if (r && typeof r.ready === 'boolean') return r.ready;
         const s = store();
         if (!s) return false;
         const g = s.getState();
@@ -488,10 +608,11 @@
         CFG,
         sleep, nextFrame, settle, spin, waitFor, round, pct,
         RUN: window.__RUN || {},
-        wr, exportsOf, findModules, findThunk, markers, buildInfo, store, connect, state, dispatch, click, goto, routeName, suiteReady,
+        wr, exportsOf, findModules, findThunk, markers, buildInfo, store, connect, state, dispatch, click, goto, routeName, suiteReady, thunk,
+        discover, tool, hasTool, syncTool, tools: discoverySummary,
         warm, injectCost,
         probes: { start: startProbes, stop: stopProbes, stats: windowStats },
-        commits: () => P.commits.length,
+        commits: () => (ownHookCounts() ? P.commits.length : commitsIn(-Infinity, Infinity)),
 
         /** One measured phase: probes on, run __A.phases[name]({ i, n, rate }, CFG), window stats out. */
         async runPhase(name, it) {
@@ -620,6 +741,7 @@
 
             // needles: the scenario's markers and every side's commit (the runner's automatic proof)
             const scan = scanModules(needles);
+            ensureDiscovered();
 
             return {
                 coverageFiles: Object.keys(globalThis.__coverage__ || {}).length,
@@ -637,6 +759,9 @@
                 desktopApi: !!window.desktopApi,
                 sentry: !!window.__SENTRY__,
                 webpack: !!wr(),
+                // the page's tools (devtoolstooldiscovery) and its own React hook, when Suite offers them
+                discovery: discoverySummary(),
+                pageHook: pageHook(),
                 // ratio ~1: no debugger attached; ~25: a DevTools debugger is on and spreads are taxed
                 canary: { spread: time(spread, 3), slice: time(slice, 3) },
                 markers: scan.counts,
