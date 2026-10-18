@@ -16,18 +16,24 @@ commit proof and the locks are what they are: `references/builds.md`.
 ```
 $PERF_AB_HOME (default ~/.local/share/suite-perf-ab — writable from the Bash sandbox, outside every worktree)
   runs/<run-id>/
-    run.json          sides, target, device, profile, scenario path    (revs.mjs creates it; you add the rest)
+    run.json          sides, target, device, profile, scenario path    (revs.mjs creates it; you add the rest;
+                      build.mjs merge-writes the sides' build fields and `bundles`: edit it any time)
     plan.json         passes                                           (rig/templates/plan.json)
     scenario/         scenario.mjs + page.js                           (copy rig/templates/, or point at examples/)
     narrative.json    verdict text for the report                      (you write it, last)
     preflight.json    last preflight result
     build-status.json build.mjs progress: side, step i/n, its estimate, state
-    out/<pass>-<n>-<side>.json|.log   one page session each; .cpuprofile with --profile-at
+    out/<pass>-<n>-<side>.json|.log   one page session each (.log: its latest attempt); .cpuprofile with --profile-at
+    out/<pass>-<n>-<side>.attempt<n>.log   every attempt's log, kept (plan.mjs)
     out/progress/<pass>-<n>-<side>.json   live snapshot of a session (run.mjs --progress)
-    out/plan-status.json              state, progress and ETA of the last plan
+    out/plan-status.json              state, progress, per-pass ETA and failures of the last plan
+    out/plan.log                      everything every plan printed, appended (a header per start)
+    out/failed-passes.json            passes a plan marked failed, kept until a later plan completes them
     summary.json      aggregate.mjs output, advice included
-    report.html       report.mjs output
+    report.html       report.mjs output (report.txt with --text: what to review before publishing)
     traces/           DevTools MCP traces moved here (the MCP can only write inside the session cwd)
+    fnbench/          fnbench.mjs: build.json, bundles/, calibration.json, plan.json, specs/, sessions/,
+                      summary.json, table.txt, status.json, cache/ (references/fnbench.md)
     open-<side>.json  pid, CDP port and URL of a live open.mjs session
   clones/<sha12>[-<variant>].<profile>/   copy-on-write clone + its build, reused by every run on that commit
     .perf-ab-build.json   its state: sha, buildSha, profile, prep, targets with their fingerprints
@@ -56,7 +62,8 @@ fails a session or a build.
 | `fingerprint.mjs` | on | files only |
 | `run.mjs`, `plan.mjs`, `open.mjs` | **off** | Chromium/Electron die on the Mach-port rendezvous inside it |
 | `tenv.mjs` | **off** | docker socket, local WebSocket |
-| `aggregate.mjs`, `report.mjs`, `status.mjs`, `attr.mjs`, `cleanup.mjs` | on | files only |
+| `aggregate.mjs`, `report.mjs`, `status.mjs`, `attr.mjs`, `cleanup.mjs`, `bundlediff.mjs` | on | files only |
+| `fnbench.mjs` | on | Node processes only (`references/fnbench.md`) |
 
 Never `chmod +x` anything: it prompts even in bypass mode. Every script runs as `node rig/<x>.mjs`.
 `rsync` is denied by a permission rule here; copy with `cp -R`.
@@ -108,7 +115,7 @@ Never `chmod +x` anything: it prompts even in bypass mode. Every script runs as 
   { "name": "counts", "role": "counts",  "order": "AB",       "args": { "k": 1, "rates": "1", "warmup": 0, "cfg": { "fiberStats": true } } },
   { "name": "pilot",  "role": "trial",   "order": "AB",       "args": { "k": 1, "rates": "4", "warmup": 0, "cfg": { "pages": 10 } } },
   { "name": "main",   "role": "timing",  "order": "ABBAABBA", "args": { "k": 8, "rates": "4,1", "warmup": 2 } },
-  { "name": "ctl",    "role": "control", "order": "ABBA",     "args": { "k": 8, "rates": "4", "warmup": 2, "altInject": 10 } },
+  { "name": "ctl",    "role": "control", "order": "ABBA",     "args": { "k": 10, "rates": "4", "warmup": 2, "altInject": 10 } },
   { "name": "big",    "role": "timing",  "order": "ABBA",     "args": { "k": 6, "rates": "4", "cfg": { "pages": 80 } } },
   { "name": "more",   "role": "timing",  "extends": "main", "order": "ABBA", "optional": true }
 ] }
@@ -127,7 +134,9 @@ it. `"extends": "main"` runs with main's args (its own `args` merged over them) 
 numbers (`main-5-A …`), so its sessions pool into main in the aggregate. Other fields (`purpose`)
 are free text. Session count is what makes a timing call possible: p ≤ 0.1 needs at least 5
 sessions in total (2 v 3 reaches 0.1, 3 v 3 0.1, 4 v 4 separated 0.029); 2 v 2 can never be called
-(0.333).
+(0.333). A control's k is its warm-up plus a multiple of 4: the injected iterations run in ABBA
+order (0 I I 0 …), so k 10 with warm-up 2 gives 4 pairs in two whole blocks. plan.mjs adds a size
+pilot (`pilot-<pass>`, trial) per timing workload no pass has measured yet — not part of plan.json.
 
 ## run.mjs — one page session
 
@@ -138,6 +147,20 @@ node rig/run.mjs --run=<id|dir> --side=A --out=<file.json>
      [--progress=<file>|false] [--role=timing|control|trial|counts] [--slot=off]
      [--pcore=auto|off] [--pcore-free=2] [--pcore-max-wait-s=900] [--max-ecore-ms=15] [--max-ecore-pct=2] [--pcore-retries=5]
 ```
+
+**Phase timeout**: a measured phase past `--phase-timeout-ms` (600 s), or one that gives up on that
+budget itself (a phase result `{ timedOut: '<what>' }`; the page reads the budget as
+`H.RUN.phaseTimeoutMs`), ends the session with **exit 3** and `record.failure = { kind:
+'phase-timeout', phase, ms }` (also in the progress snapshot): the same configuration would time out
+again, so plan.mjs does not retry it. Other failures exit 1.
+
+**`--alt-inject`** (the paired control): the measured iterations inject in ABBA order (0 I I 0 0 I I
+0 …; warm-up iterations alternate), so cost that climbs from one iteration to the next falls on both
+halves alike. A k that leaves an incomplete block logs a note; aggregate's landing, paired with
+each injected iteration's plain neighbours, does not depend on the order. **Power**: `meta.power` (start) and `meta.powerEnd` record the power
+source and Low Power Mode (lib.mjs `powerState`, `pmset`; `PERF_AB_POWER=ac|battery|lowpower`
+overrides it). The progress snapshot carries the running iteration's `iterStartedAt` and
+`iterGateMs` (its wait for performance cores) for plan.mjs's first-iteration check.
 
 `--headed` (web) runs the full Chromium with a window instead of the headless shell. The window is
 created as a background target (CDP `Target.createTarget` with `background: true`), so it does not
@@ -343,8 +366,8 @@ A phase record merges three sources:
 | Source | Fields |
 | --- | --- |
 | window (`ms` = phase wall time) | `ms` |
-| in-page probes, same on both sides | `commits`, `frames`, `frameP50/P95/P99/Max`, `framesOver50/100`, `jankMs`, `lagP95/P99/Max`, `lagOver50` (10 ms timer chain: input-delay proxy), `longTasks`, `longTaskMs`, `longestTaskMs`, `tbtMs`, `loafs`, `loafBlockingMs`, `loafScriptMs`, `forcedLayoutMs`, `interactions`, `inpMs` (trusted input only), `cls`, `heapPeak` |
-| CDP, thread ticks | `taskMs`, `scriptMs`, `layoutMs`, `styleMs`, `otherMs` (= task − script − layout − style: GC, IDB, native, parsing), `layouts`, `styleRecalcs`, `heapEndMiB` |
+| in-page probes, same on both sides | `commits`, `frames`, `frameP50/P95/P99/Max`, `framesOver50/100`, `jankMs`, `lagP95/P99/Max`, `lagOver50` (10 ms timer chain: input-delay proxy), `longTasks`, `longTaskMs`, `longestTaskMs`, `tbtMs`, `loafs`, `loafBlockingMs`, `loafScriptMs`, `forcedLayoutMs`, `interactions`, `inpMs` (trusted input only), `cls`, `heapPeak` (`performance.memory`, live since both launchers pass `--enable-precise-memory-info`; records from before read a bucketed value that barely moves: 45.2 MiB in every iteration of every history-load session) |
+| CDP, thread ticks | `taskMs`, `scriptMs`, `layoutMs`, `styleMs`, `otherMs` (= task − script − layout − style), `layouts`, `styleRecalcs`, `heapEndMiB`. **`otherMs` is mostly JavaScript run as microtasks** — promise continuations: thunk, reducer and middleware work after an `await` — because CDP's `ScriptDuration` counts task callbacks (timers, messages, events) but not microtasks (Chromium 151: 200 ms of busy JS in a timer → script 200, other 0; the same in a microtask or after an `await` → script 0, other 200); GC, IndexedDB and other native work are the smaller rest. In Suite, read `scriptMs + otherMs` as the JS cost, and a change in `otherMs` as JS first |
 | counting passes only (`cfg.fiberStats`) | `fibers`, `fibersRendered`, `fibersMounted`: fibers walked, rendered and mounted over the window's commits |
 | the scenario | whatever the phase returned (`rows`, `pages`, `persistMs`, …; numbers in nested objects as `<field>.<key>`, e.g. `counts.put.txs`), `injectedCalls`/`injectedMs` |
 
@@ -376,8 +399,12 @@ most thunks module-internal), `exportsOf(id)`, `markers(needles)`, `click(testid
 to)`, `runPhase`, `windowStart/End`, `idleWindow`, `calib`, `env`; the page's own tools when
 Suite answers `devtoolstooldiscovery` (references/discovery.md): `discover()`, `tool(name, args)`,
 `hasTool`, `syncTool`, `tools()`, `thunk(typePrefix)` (`arg => Promise<resolved action>` through
-`suite.thunk`, else the bundle's export) — `goto`, `suiteReady` and `connect` prefer the page's
-tool and keep their previous way as the fallback; and the discard protocol:
+`suite.thunk`, else the bundle's export; its `via` says which ran — Suite answers discovery
+asynchronously, so before `discover()` has run the callable decides at its first call instead of
+settling for the export, which desktop does not have; `await H.discover()` first to know `via` up
+front) — `goto`, `suiteReady` and `connect` prefer the page's
+tool and keep their previous way as the fallback; `RUN` carries `k`, `rates`, `iterations`,
+`spares`, `side`, `target`, `device` and `phaseTimeoutMs`; and the discard protocol:
 `abort(reason)` (ends the running phase; `sleep`, `settle`, `waitFor` and `injectCost` throw at
 their next step), `drainAborted(ms)` (waits for the aborted work to finish) and `clearAbort()`.
 
@@ -393,6 +420,9 @@ Rules the contract encodes:
 - **`after` restores the state** the next iteration expects and verifies the iteration did what it
   claims (rows persisted, nothing resurrected). `valid` turns that into a dropped iteration.
 - **`H.injectCost()` once per unit of work** (per page, per row batch) makes the paired control meaningful.
+- **A phase that waits on its own** (a drain, a poll) stops before `H.RUN.phaseTimeoutMs` and
+  returns `{ timedOut: '<what it saw>' }` (examples/history-load drain): a phase timeout with a
+  reason, not an iteration that silently waited for minutes, and never a second, shorter timeout.
 - Counting instrumentation (patched prototypes, fiber walks: `cfg.fiberStats`) belongs in its own
   pass, never in a timing pass.
 
@@ -400,9 +430,44 @@ Rules the contract encodes:
 
 ```
 node rig/plan.mjs --run=<id> [--plan=<file>] [--only=main,ctl] [--dry] [--retries=1] [--heartbeat=30]
+     [--size-pilot=off] [--first-iter-x=5]
      [--pcore=auto|off] [--pcore-free=2] [--pcore-max-wait-s=900] [--max-ecore-ms=15] [--max-ecore-pct=2] [--pcore-retries=5]
      [--slot=off] [--max-load=6] [--max-wait-s=900]
 ```
+
+**Fail fast, never at the cost of precision.**
+- *Size pilot*: right before the first timing or control session, one AB pair (k 1, 4x, warm-up 0,
+  role trial, `pilot-<pass>`) for every distinct workload (cfg + target) of the selected timing and
+  control passes that neither a trial pass of the plan nor a finished session has measured. Its
+  iteration time sizes those passes' ETAs and the first-iteration check; trial sessions are never
+  pooled into a verdict. `--size-pilot=off` skips it (an emulator run, where each session costs
+  minutes).
+- *Phase timeout*: a session that ended on run.mjs's phase timeout (exit 3) is not run again with
+  the same configuration: its pass is marked failed with the reason (`drain > 10:00`), and when a
+  trial stood in for other passes' workload (a size pilot, a pilot with their cfg) those passes too;
+  their sessions are not run, the plan goes on with the other passes and lists the failures at the
+  end (also in `out/failed-passes.json`, which the report reads, until a later plan completes the
+  pass). Other failures are retried (`--retries`).
+- *First iteration*: the first iteration of a pass (the first session of a pass with no finished
+  session) that runs past `--first-iter-x` (5) × its workload's iteration time — waits for
+  performance cores not counted — is stopped and its pass marked failed the same way. Single
+  iterations are never dropped or trimmed.
+- Observed before these rules: a 5,000-tx history-load pass with persistence on drained IndexedDB
+  past the 10-min phase timeout, exited after 32:49, and its retry hung 10 more minutes.
+
+**Power**: before every timing or control session (and every retry) the plan reads the power
+source (lib.mjs `powerState`). On battery or in Low Power Mode it waits instead of measuring —
+`current: { stage: 'power-wait', waiting: 'power', next, power }` in plan-status.json, status.mjs
+and a heartbeat line (`power-wait before h20-1-A: battery … · 3:10`; past 10 minutes it adds "ask
+the user to plug in") — with no time limit; counts and trial passes still run.
+`PERF_AB_POWER=ac|battery|lowpower` overrides the reading to test the gate.
+
+**Logs**: the plan's whole output is appended to `out/plan.log` (a header per start) whatever
+stdout is redirected to — with the sandbox off `$TMPDIR` is another directory, so a redirect there
+gets lost; every attempt of a session logs to `out/<session>.attempt<n>.log` (a retry never
+overwrites the failed attempt), copied to `out/<session>.log` when it ends; each failed attempt's
+exit, error and failure kind go to `plan-status.json` `sessions[].attempts` and to the plan's last
+lines. The plan ends with `aggregate.mjs --brief` (the full tables: `aggregate.mjs --run=<id>`).
 
 Builds: a complete session made from another commit than its side's current build (`sideCommit`:
 `buildSha` or `sha` — the side was re-pinned or rebuilt) is stale and runs again. A deployed-preview
@@ -442,25 +507,56 @@ ETA) comes on every stage or rate change and every `--heartbeat` seconds; `--max
 retries print their own lines. **ETA model** (lib.mjs `etaModel`): a session takes overhead
 (fixed + per rate; with sessions of one rate count only, all of it per rate) + per rate k × the
 wall time of one iteration at that rate (the warm-up iterations are part of k), learned from the
-finished sessions' `meta.timing` in pools: the same pass, then the same role and cfg, then any
-timing or trial pass, then counts and controls. An estimate from the last two pools is rough and
-printed `~0:31`. A rate a pool has not run scales one it has by their ratio in sessions that ran
-both, else by 1 (wall time per iteration barely follows the throttle: 3.0–4.0 s at 1x, 3.7–4.1 s
-at 4x in the smoke runs). The running session uses its own iteration times. With no finished
-session it says "ETA after the first session" instead of guessing.
+finished sessions' `meta.timing` in pools: the same pass; the same role, cfg and target; the same
+cfg and target in any measured role (the size pilot); any timing or trial pass; counts and
+controls. Iteration time follows the workload's size (PR 33507: a 10-page pilot estimated 1:27 for a
+1,000-tx session that took 4:17, and 1:32 for a 5,000-tx one that took over 30 min), so an estimate
+from another workload (the last two pools) is rough and printed `~0:31`, and the sessions of the
+running session's pass are re-estimated from its own iterations as they finish (the start line of
+a pass whose estimate was rough says so; its first finished session prints the new estimate). A
+rate a pool has not run scales one it has by their ratio in sessions that ran both, else by 1 (wall
+time per iteration barely follows the throttle: 3.0–4.0 s at 1x, 3.7–4.1 s at 4x in the smoke
+runs). With no finished session it says "ETA after the first session" instead of guessing.
 
 `out/plan-status.json` (atomic, every second while a session runs): `run, plan, pid, state
 (running | finished | failed | interrupted — SIGINT/SIGTERM too), startedAt, updatedAt,
-elapsedMs, totals { toRun, done, failed, skipped }, current` (the running session merged with its
-live progress, or `{ waiting: 'load' }`), `sessions [{ id, pass, side, state, startedAt,
-durationMs, exit, endedAt, iterations }], etaMs, etaAt, etaRough`, plus the earlier fields
-(`started, total, done, skipped, failed[], etaS, durationsS, finished`).
+elapsedMs, totals { toRun, done, failed, skipped, notRun }, current` (the running session merged
+with its live progress and its attempt log, or `{ waiting: 'load' | 'power' }`), `passes [{ name,
+base, role, sizePilot, sessions, done, completeBefore, failed, notRun, state (todo | running | done |
+failed), reason, leftMs, rough, finishAt }]` (in plan order: the checklist's source),
+`failedPasses { <pass>: { reason, session, via } }, powerWaitMs, log, sessions [{ id, pass, side,
+state (todo | running | done | failed | not-run | skipped), startedAt, durationMs, exit, endedAt,
+iterations, log, attempts [{ attempt, exit, error, failure, log }] }], etaMs, etaAt, etaRough`,
+plus the earlier fields (`started, total, done, skipped, failed[], etaS, durationsS, finished`).
 
 ## status.mjs
 
 ```
-node rig/status.mjs --run=<id> [--json] [--watch[=<s>]]
+node rig/status.mjs --run=<id> [--json] [--watch[=<s>]] [--events [--every=30]]
 ```
+
+**For a person, in a terminal tab — not with `!` in the Claude prompt**: a `!` check re-enters the
+conversation, and the agent's reply to it re-reads the whole context (8 such checks cost 6.8M tokens
+in a 330–430k-token session). The agent opens a tab running `status.mjs --run=<id> --watch` with the
+terminal tools when a plan starts. `--watch` and `--events` wait up to a minute for a plan that is
+about to start.
+
+`--events` is for the agent's Monitor tool: it polls every `--every` s (30) and prints one line per
+event, then exits on an end state:
+
+```
+13:32 pass h20 (timing) · 8 sessions · ≈ 13:58 started · pilot done · 6/30 done · plan ETA ≈ 14:21 · counts ✓ · pilot ✓ · pilot-h20 ✓ · h20 ▶ ≈13:58 · ctl ≈14:06 · h40 ≈14:21
+13:40 power-wait before h20-3-B: battery — timing waits for AC power
+13:50 power-wait over 10 min before h20-3-B (battery) — ask the user to plug in
+14:21 plan finished · 28 run, 0 failed, 0 not run, 2 before · took 0:49:10 · the brief is at the end of out/plan.log · …
+```
+
+A pass starting (with the pass that ended and its outcome, and every pass's state and expected
+finish: what the checklist shows), a power-wait starting and passing 10 minutes, and the end
+states: finished, failed (with the failed passes), interrupted, stalled (a session snapshot or the
+plan's status older than 2 min), plan process gone. Each line wakes the agent: one model call
+(~0.15–0.25M tokens in a fresh session), ~6–10 a run. Arm it with `timeout_ms` 1800000 and re-arm it
+when the monitor expires; a plan that ended meanwhile is reported at once.
 
 Reads run.json, `out/plan-status.json`, the running session's progress file and
 `build-status.json`, prints at most 8 lines and exits:
@@ -474,7 +570,9 @@ last main-2-B exit 0 in 0:26 · 4 iterations · 11:45
 ```
 
 The `now` line also says how long the current stage has run (a session waiting for the machine reads
-`queued for the machine · <holder> · <wait>`), and a `machine` line names who holds the machine slot
+`queued for the machine · <holder> · <wait>`, a plan waiting for AC power `power-wait before
+<session> (<pass>): battery since 13:40 · 3:10`), a `failed passes` line names each failed pass and
+its reason, and a `machine` line names who holds the machine slot
 and who waits when another run is involved. It flags (`! …`) a plan or session
 whose pid is gone while its state says running (crashed or killed: run the plan again to resume),
 and a session snapshot older than 2 min (stuck: a live session writes one at least every 30 s; the
@@ -489,8 +587,23 @@ as an agent's wait.
 ## aggregate.mjs
 
 ```
-node rig/aggregate.mjs --run=<id> [--passes=main,ctl] [--print=main] [--warmup=<n>] [--all] [--allow-mixed-builds]
+node rig/aggregate.mjs --run=<id> [--passes=main,ctl] [--print=main] [--warmup=<n>] [--all] [--brief]
+     [--allow-mixed-builds] [--allow-mixed-power]
 ```
+
+`--brief` (what plan.mjs prints at its end; ≤ ~1.5k tokens for a typical run) changes only the
+console: per timing pass × rate every headline metric on one line (Δ of the session medians, the
+session medians, verdict, p), **every** other separated metric on one line (`also <key> Δ verdict
+p` — a percentile artifact shows up there), the drift; per control pass the verdict and each
+session's landing (paired with neighbours, with the trend fit and the naive one); counts that differ (`commits 141→142`); a trial
+pass's first headline values; one env line per side (`env A: 04caace736 ✓ 19/19 · release · pcore
+16/16 gated, 1 discarded, E 0.02 % · power ac 19`); then the advice, flags, warnings and `next:`
+lines. `summary.json` and the report keep everything; the statistics do not change.
+
+**Power**: a timing pass whose sessions ran on different power sources (`ac`, `battery`,
+`+lowpower`, or `mixed` when one changed mid-session; from `meta.power`/`powerEnd`) is refused —
+exit 2, no summary — unless `--allow-mixed-power` (a warning then); one that ran entirely on battery
+gets a warning. Records from before the power gate have no source and never block.
 
 Builds first: the commit every session ran (`env.build.commit`, else `meta.buildSha`/`meta.sha`). A
 side whose sessions ran more than one commit is refused — exit 2, no summary — unless
@@ -506,7 +619,34 @@ Per pass × rate × side: kept iterations (after warm-up, no problem, inject = 0
 ms). For each metric: pooled `{ n, p50, p75, p90, min, max, mean }`, one median per session, and the
 B-vs-A delta `{ p75Pct, medPct, separated, p }` — `separated` is `B lower|B higher|overlap` (needs ≥2
 sessions a side), `p` a permutation p-value over session medians. Control passes report, per
-session, how much of the injected cost landed in each `*.taskMs`. Console: headline metrics, then
+session (`R.control[side][]`), the landing the verdict reads, **paired with neighbours**
+(`neighbour`: every injected iteration against the plain iterations around it — the line between
+the nearest plain one before and after it at its position, with 0 I 0 I their mean, with 0 I I 0
+the interpolation at each I; the one plain neighbour at an end — on the phases the cost went into,
+those with `injectedMs`; the session's landing is the median of (injected − reference) ÷ what it
+injected, `pcts` per pair). Next to it, as cross-checks, the **trend fit** (`trend`: the injected
+iterations' residuals from a line through all plain ones, averaged; with the line's slope) and the
+**naive** one (`landed`: median injected − median plain per `*.taskMs` and `total.taskMs`), and the
+measured order (`seq`, `0II00II0`). Why: load that climbs inside a session lands on whichever
+iterations run later — PR 33507's history-load climbed +109 to +226 ms an iteration on a ~5–6 s load
+(both sides, persistence on or off: Suite's historic-rates map grew by 1,000 hours a load until
+examples/history-load reseeded it); with the old 0 I 0 I order every injected iteration ran a step
+after its plain partner. Measured: PR 33507's ctl sessions read naive 123–205 %, trend fit 92–113 %,
+paired 91 / 108 / 107 / 121 % (ctlnr 103–121 %); after the reseed, two k 14 sessions (6 pairs each)
+land at 106 / 109 % paired, where median injected − median plain reads 110 / 132 % on the same phase
+— the noisier estimator even without drift. A residual of ~5–10 % over 100 comes with the injection
+itself. The coinjoin IPC scenario has no climb and lands every way (paired 99–108 %). **Drift**: per
+timing and control session the slope of the headline CPU metric (the first headline
+`*taskMs`/`*cpuMs`, else `total.taskMs`) over its kept iterations (≥ 3), in ms and % of the session
+median an iteration (`sessions[].drift`). It is *consistent* when the median passes 1 %/it with
+≥ 75 % of sessions agreeing in sign, and **flagged** (`R.drift.flagged`, `advice.drift`) only when it
+can matter: the climb over a session, |median slope| × k/2, reaches a third of what the pass reports
+— the largest |Δ| (ms, between the sides' session medians) among its called headline metrics, or
+the drift metric's own Δ when none is called; for a control pass the injected cost. Below that it
+prints as information (`climbMs`, `ref`, `matters`). Examples: coinjoin-address-stats main @ 1x,
++0.2 ms/it × 4 = 0.8 ms against info.ms −92 ms: information; PR 33507 h40 @ 4x, +155 ms/it × 4 =
+618 ms against load.ms −431 ms: flagged. A slope from 3–6 points is noisy: one session alone proves
+little. Console: headline metrics, then
 any other metric with p ≤ 0.1 and |Δ| ≥ 5%; a counting pass (name with `count`) prints its
 deterministic counts instead (commits, fibers, layouts, the scenario's), never its timing.
 
@@ -538,8 +678,14 @@ passes.
 ## report.mjs
 
 ```
-node rig/report.mjs --run=<id> [--narrative=<file>] [--out=<file>] [--main=<pass>]
+node rig/report.mjs --run=<id> [--narrative=<file>] [--out=<file>] [--main=<pass>] [--text]
 ```
+
+`--text` also writes `report.txt`: every visible text of the page in reading order (verdict cards,
+findings, sections, every table as `| cell | cell |` rows, the session medians of each dot strip
+from its tooltips, controls, rig health, caveats, method), then every `href`/`src` URL and any
+`<script>` in the HTML; no CSS or SVG markup. Review it before publishing instead of reading the
+HTML: the 84–140 KB pages cost ~40k tokens to read, their text 25–41 KB.
 
 Self-contained HTML (inline CSS/SVG, Google Fonts), light and dark, no horizontal scroll at phone
 width. The side cards carry the build proof (the commit every session ran, ✓ against the pinned one,
@@ -548,19 +694,23 @@ it; caveats on how the revisions were pinned and on the profile. Verdict cards (
 of the main pass — the first timing pass, or `--main`; never a counting, trial or control pass,
 and "no timing pass yet" without one; a direction is only called when sessions separate with
 p ≤ 0.1), findings and custom
-sections, one table per pass × rate with per-session dot strips, controls, dropped iterations,
-build provenance and rig health per side (markers, coverage, renderers, calibration ratio, idle
-CPU, debugger canary), caveats, method. Load the `artifact-design` skill, then publish with the
-Artifact tool.
+sections, one table per pass × rate with per-session dot strips, the in-session drift (a callout
+when flagged, information otherwise), controls (order, expected, the landing paired with
+neighbours and its pairs, the trend fit, the naive landing, the plain trend),
+dropped iterations, build provenance and rig health per side (markers, coverage, renderers,
+calibration ratio, idle CPU, debugger canary, performance cores, power), the passes plan.mjs marked
+failed, the bundle comparison, caveats, method. Load the `artifact-design` skill, then publish with
+the Artifact tool.
 
 ## Other scripts
 
 - `revs.mjs --run=<id> (--pr=<n|url> | --branch=<name|sha> [--base=develop]) [--accept-behind=merge-base|merge-ref] [--no-fetch] [--json]` — pins A (the target branch's tip) and B (the head) after the up-to-date check; exit 3 when the branch is behind (nothing pinned), 2 on an error. `references/builds.md`.
 - `fingerprint.mjs --run=<id> [--sides=A,B] [--target] [--json]` or `fingerprint.mjs <build dir> [--expect=<sha>]` — the commit, release string, coverage and React Compiler coverage of a build, from its files. Exit 1 on a commit mismatch, coverage or mixed commits.
-- `build.mjs --run=<id> [--targets=web,desktop] [--sides=A,B] [--profile=release|preview] [--rebuild] [--network-install] [--node=<binary>] [--slot=off]` — see SKILL.md step 3 and `references/builds.md`. Prints the steps and an estimate up front, numbers them per side (`[A 3/4] web build … (last 0:52)` … `[A 3/4] web build done in 0:53`, a heartbeat every 30 s in between; step output goes to `<clone>/.perf-ab-logs/`, never stdout), keeps the last 5 durations per step in `$PERF_AB_HOME/timings.json`, and writes `build-status.json` (side, step i/n, start, estimate, ETA, state; `interrupted` on SIGINT/SIGTERM) for `status.mjs`. Each side's state is read again when its turn comes, so an A/A run on one clone builds once.
+- `build.mjs --run=<id> [--targets=web,desktop] [--sides=A,B] [--profile=release|preview] [--rebuild] [--network-install] [--node=<binary>] [--slot=off]` — see SKILL.md step 3 and `references/builds.md`. Merge-writes run.json (re-read right before writing; only the sides' `sha, buildSha, profile, clone, web, desktop, fingerprint, guide`, `build.profile` and `bundles` change, so edits made while it builds survive; a side re-pinned meanwhile keeps its new revision and gets no record of the old build), then compares the bundles (`bundlediff.mjs`). Prints the steps and an estimate up front, numbers them per side (`[A 3/4] web build … (last 0:52)` … `[A 3/4] web build done in 0:53`, a heartbeat every 30 s in between; step output goes to `<clone>/.perf-ab-logs/`, never stdout), keeps the last 5 durations per step in `$PERF_AB_HOME/timings.json`, and writes `build-status.json` (side, step i/n, start, estimate, ETA, state; `interrupted` on SIGINT/SIGTERM) for `status.mjs`. Each side's state is read again when its turn comes, so an A/A run on one clone builds once.
 - `open.mjs --run=<id> --side=B [--target] [--port=9222|auto] [--headed] [--no-seed] [--minutes=90]` — references/mcp.md. Without `--port` it takes the first free port from 9222.
 - `tenv.mjs up|status|prepare|yes|screen|down` — references/emulator.md. While it waits for the Docker engine, the controller or a port it prints `waiting for … · 0:20 of 2:00` every 10 s.
 - `attr.mjs <x.cpuprofile> --run=<id> --side=A [--top=25] [--json=<f>]` — source-mapped self/inclusive time per file and function.
-- `cleanup.mjs [--clones --older-than=3 | --clone=<name> | --apps | --refs]` — list (clones, runs, lock queues) or free disk; never removes a clone in use by a live session, exploration or build. `--refs` drops the `refs/perf-ab/*` refs revs.mjs fetched.
+- `bundlediff.mjs --run=<id> [--targets=web,desktop]` or `bundlediff.mjs <dirA> <dirB> [--shas=<a>,<b>]` — whether the sides built the same code: JS paired by hash-stripped name and compared with the commit, chunk hashes, the signed message-system config and short mangled identifiers masked, per part (web `build/`; desktop renderer `build/` and main `dist/`). build.mjs runs it after both sides of a target are built and writes run.json `bundles`; preflight shows it. `references/builds.md`.
+- `cleanup.mjs [--clones --older-than=3 | --clone=<name> | --apps | --refs] [--run=<id>] [--force]` — list (clones, runs, lock queues) or free disk; never removes a clone in use by a live session, exploration or build. A shared clone — its commit a side in another run's run.json than `--run` (without `--run`: in two or more runs, built or only pinned), or the tip of a local branch other local branches are based on — is kept with a warning unless `--force`. `--refs` drops the `refs/perf-ab/*` refs revs.mjs fetched.
 - `rig/locks.mjs` — the lock queues (`machine`, `clone-<name>`, `emulator`) and the clone-users registry; `PERF_AB_SLOT=off` or `--slot=off` skips the machine slot.
 - `scripts/analyze-trace.mjs <trace.json[.gz]>` — category breakdown of a DevTools trace (MCP traces too).

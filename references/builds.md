@@ -1,8 +1,8 @@
 # Builds: what is compared, how it is built, and the proof
 
 Both sides of a run are built locally, from pinned commits, with CI's recipe, in copy-on-write clones
-of the checkout. This page is the why behind `revs.mjs`, `build.mjs` and `fingerprint.mjs`; the
-flags are in `references/rig.md`. Measured on 2026-10-13 (M4, PR #32496 merged into develop).
+of the checkout. This page is the why behind `revs.mjs`, `build.mjs`, `fingerprint.mjs` and
+`bundlediff.mjs`; the flags are in `references/rig.md`. Measured on 2026-10-13 (M4, PR #32496 merged into develop).
 
 ## The pair: the target branch against the feature branch
 
@@ -150,6 +150,43 @@ and connect-popup entries; on desktop in the renderer's `main.<hash>.js` and in 
 `markers` in `run.json` are now optional: they prove that a given piece of code is in the bundle
 (not tree-shaken, not behind a flag), which the commit cannot.
 
+## Did the change reach the bundle at all — the bundle comparison
+
+After both sides of a target are built, `build.mjs` compares their JS (`rig/bundlediff.mjs`) and
+prints per target either **code-identical between sides (apart from mangled names, hashes, commit,
+signed config)** or the files that differ with their size deltas; `run.json` keeps it as `bundles`
+(`{ web: { "A-B": { identical, parts: { web: { files, byteSame, differing } } } } }`) and
+`preflight.mjs` shows it. A code-identical target is **unaffected by the change: report it so, do
+not time it** — timing two identical programs only measures the noise. The parts are compared
+separately: web `build/`, the desktop renderer `build/` and the desktop main process `dist/` (where
+the utility-process threads live).
+
+Plain checksums cannot answer it: two builds of different commits differ byte for byte in most
+chunks even when no code changed. What differs between any two builds is masked first:
+
+| Masked | Why it differs |
+| --- | --- |
+| content-hashed names (`main.1a2b3c4d.js`): chunks pair by name with the 8-hex hash stripped | the hash covers the inlined commit |
+| both sides' commits, full and short (any hex run starting with the first 7 characters) | `COMMITHASH`, the release string |
+| quoted 8-hex chunk-hash maps (`"1a2b3c4d"`) and `.<hash>.js` references | the runtime's chunk table |
+| `eyJ…` JWT-like tokens | the message-system config is signed at build time |
+| identifiers of 1–3 characters not after a dot (`(?<![\w$.])[A-Za-z_$][\w$]{0,2}(?![\w$])` → one placeholder) | the minifier renames them when modules shift |
+
+Strings, numbers, property names and longer identifiers are never masked, so a code change still
+shows. Measured on the coinjoin-address-stats pair (04caace736 vs 9ae5eeea9b, the one-pass
+`getAccountInfo` rewrite): web (265 JS files) and the desktop renderer (218) code-identical, only
+`dist/threads/coinjoin-backend.js` different (+177 bytes) — while the web builds differed byte for
+byte in 10–65 files depending on the pair of builds. The comparison takes under a second (byte-equal
+files skip the masks) and is cached in run.json by both sides' commits, profiles and build times;
+`node <skill>/rig/bundlediff.mjs --run=<id>` runs it again, `bundlediff.mjs <dirA> <dirB>` compares
+two build dirs by hand.
+
+`build.mjs` writes run.json as a **merge**: it reads the file again right before writing and changes
+only what the build owns (the sides' `sha, buildSha, profile, clone, web, desktop, fingerprint,
+guide`, `build.profile`, `bundles`), so the title, scenario, cfg or device edited while it builds
+survive (both earlier runs lost such edits to template placeholders). A side re-pinned meanwhile
+keeps its new revision and gets no record of the old build: build again.
+
 ## React Compiler coverage, per side
 
 `packages/suite` is not compiled on develop today, but compiler rollouts are the A/Bs most likely to
@@ -199,6 +236,17 @@ whose numbers are not compared with anything.
 
 Disk is the other shared limit: every pinned commit × profile is a clone of ~1-2 GiB of real blocks
 once built. `preflight.mjs` checks free space; `cleanup.mjs --clones --older-than=3` frees it.
+
+**Shared clones.** Runs on one base share its clone (the second run's base builds in 0 s). So
+`cleanup.mjs` keeps, with a warning, any clone whose commit is a side in another run's run.json than
+the one you are done with (`--run=<id>`; without it, a clone pinned by two or more runs, built or
+only pinned) or is the tip of a local branch of the main checkout that other local branches are
+based on; `--force` removes it anyway. A clone only one run uses goes as before. Seen without the
+guard: the base clone (04caace736) was removed after the coinjoin run and rebuilt (~2.5 min) for
+PR 33507's run on the same base.
+
+Several runs in one conversation: start each in its own session (SKILL.md step 0) — a run re-reads
+everything earlier in its conversation on every model call.
 
 ## Build-config changes considered
 

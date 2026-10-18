@@ -191,7 +191,8 @@
     // with a respondWith callback — so one app-side contract serves MCP exploration and Playwright
     // measurement alike. A page without the listener (an ungated build, a Suite without the tools)
     // answers nothing, and every helper that prefers a tool falls back to the rig's own way.
-    const disc = { groups: [], exec: new Map(), found: false };
+    // asked: discover() has run (with its tick of grace), so a missing tool is really missing
+    const disc = { groups: [], exec: new Map(), found: false, asked: false };
     const takeGroups = groups => {
         disc.groups = groups;
         disc.exec = new Map();
@@ -230,6 +231,7 @@
         const groups = ask();
         if (!groups.length) await rawSleep(0);
         if (groups.length || refresh) takeGroups(groups);
+        disc.asked = true;
 
         return discoverySummary();
     };
@@ -553,13 +555,27 @@
     /**
      * A callable for an RTK thunk by type prefix: the page's suite.thunk tool when it offers one
      * (desktop bundles keep most thunks module-internal), else the bundle's export. Returns
-     * `arg => Promise<resolved action>`, or null when neither finds it.
+     * `arg => Promise<resolved action>` (its `via` says which path ran: 'suite.thunk' or 'bundle
+     * export'), or null when neither finds it. Suite answers devtoolstooldiscovery asynchronously, so
+     * before discover() has run hasTool() reads false: the callable then decides at its first call,
+     * after discovering, instead of settling for the bundle export (which desktop does not have).
      */
     const thunk = typePrefix => {
-        if (hasTool('suite.thunk')) return arg => tool('suite.thunk', { typePrefix, arg });
+        const viaTool = arg => tool('suite.thunk', { typePrefix, arg });
+        if (hasTool('suite.thunk')) return Object.assign(viaTool, { via: 'suite.thunk' });
         const fn = findThunk(typePrefix);
+        const viaExport = arg => dispatch(fn(arg));
+        if (disc.asked) return fn ? Object.assign(viaExport, { via: 'bundle export' }) : null;
+        const lazy = async arg => {
+            await discover();
+            lazy.via = hasTool('suite.thunk') ? 'suite.thunk' : fn ? 'bundle export' : null;
+            if (!lazy.via) throw new Error(`thunk ${typePrefix}: neither the page's suite.thunk tool nor a bundle export (desktop bundles keep most thunks module-internal)`);
 
-        return fn ? arg => dispatch(fn(arg)) : null;
+            return lazy.via === 'suite.thunk' ? viaTool(arg) : viaExport(arg);
+        };
+        lazy.via = 'undecided (discovers at the first call)';
+
+        return lazy;
     };
     const suiteReady = () => {
         // the page's own answer when it offers one (synchronous by contract), else the store

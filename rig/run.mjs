@@ -28,7 +28,19 @@
  * Progress: a JSON snapshot (--progress, default <out dir>/progress/<session>.json) of the stage
  * (queued, emulator, launch, seed, checks, calibrate, idle, warm-up, pcore-wait, ready, measure,
  * profile, done | failed | interrupted), rate, iteration, phase and the wall time of every finished
- * iteration; the same timing lands in the record as meta.timing for later estimates.
+ * iteration; the same timing lands in the record as meta.timing for later estimates. The running
+ * iteration's start and its wait for performance cores (iterStartedAt, iterGateMs) let plan.mjs stop a
+ * pass whose first iteration runs far beyond its size pilot.
+ *
+ * Phase timeout: a measured phase that runs past --phase-timeout-ms (600 s), or gives up on that
+ * budget itself (a phase result { timedOut: '<what>' }; the page reads it as H.RUN.phaseTimeoutMs),
+ * ends the session with exit 3 and record.failure = { kind: 'phase-timeout', phase, ms }: the same
+ * configuration would time out again, so plan.mjs does not retry it. Other failures exit 1.
+ *
+ * --alt-inject (the paired control): the measured iterations inject in ABBA order (0 I I 0 0 I I 0 …),
+ * so a cost that climbs inside the session falls on both halves alike; k = warm-up + a multiple of 4
+ * keeps the blocks whole. The power source is recorded at the start and the end (meta.power,
+ * meta.powerEnd: AC, battery, Low Power Mode).
  *
  * Parallel runs (rig/locks.mjs): a session first takes the machine slot — one page session or build
  * step per machine, whichever run it belongs to (stage `queued` while another holds it; --slot=off
@@ -48,7 +60,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { RIG, parseArgs, numbers, loadRun, sideOf, resolveIn, repoRoot, readJson, writeJson, writeJsonSafe, log, loadavg, sleep, dur, importScenario, roleResolver, SESSION_FILE, SPARES, passArgv, PROFILES } from './lib.mjs';
+import { RIG, parseArgs, numbers, loadRun, sideOf, resolveIn, repoRoot, readJson, writeJson, writeJsonSafe, log, loadavg, sleep, dur, importScenario, roleResolver, SESSION_FILE, SPARES, passArgv, PROFILES, powerState, powerKey } from './lib.mjs';
 import { launch } from './launch.mjs';
 import { Pcore } from './pcore.mjs';
 import { acquire, holderText, slotOff, cloneOf, useClone } from './locks.mjs';
@@ -170,16 +182,36 @@ const pageFile = path.resolve(path.dirname(scenarioFile), scenario.page || 'page
 const initScript = [
     'window.Playwright = true;',
     `window.__CFG = ${JSON.stringify(cfg)};`,
-    `window.__RUN = ${JSON.stringify({ k: K, rates: RATES, iterations: K * RATES.length, spares: SPARES, side: side.key, target, device })};`,
+    `window.__RUN = ${JSON.stringify({ k: K, rates: RATES, iterations: K * RATES.length, spares: SPARES, side: side.key, target, device, phaseTimeoutMs: PHASE_TIMEOUT })};`,
     fs.readFileSync(path.join(RIG, 'page', 'core.js'), 'utf8'),
     fs.readFileSync(pageFile, 'utf8'),
 ].join('\n');
 
 const sideLog = (...a) => log(side.key, ...a);
-const withTimeout = (p, ms, what) => {
+/**
+ * A measured phase that ran past --phase-timeout-ms, or gave up on that budget itself (a phase result
+ * `{ timedOut: '<what>' }`). The session stops and exits PHASE_TIMEOUT_EXIT; plan.mjs does not run it
+ * again with the same configuration (it would time out again) and marks its pass failed with the reason.
+ */
+class PhaseTimeout extends Error {
+    constructor(phase, ms, detail) {
+        super(`phase ${phase} timed out after ${ms} ms${detail ? ` (${detail})` : ''} — ${phase} > ${dur(ms)}`);
+        Object.assign(this, { phase, ms, detail: detail || null });
+    }
+}
+const PHASE_TIMEOUT_EXIT = 3;
+const withTimeout = (p, ms, phase) => {
     let t;
 
-    return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`${what} timed out after ${ms} ms`)), ms); })]).finally(() => clearTimeout(t));
+    return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new PhaseTimeout(phase, ms)), ms); })]).finally(() => clearTimeout(t));
+};
+// --alt-inject: ABBA inside the session over the measured iterations (0 I I 0 0 I I 0 …), so cost that
+// climbs from one iteration to the next falls on both halves alike; the warm-up alternates (0 I)
+const injectAt = i => {
+    if (!ALT_INJECT) return Number(cfg.inject || 0);
+    if (i < WARMUP) return i % 2 ? ALT_INJECT : 0;
+
+    return [1, 2].includes((i - WARMUP) % 4) ? ALT_INJECT : 0;
 };
 const PERF = ['TaskDuration', 'ScriptDuration', 'LayoutDuration', 'RecalcStyleDuration', 'LayoutCount', 'RecalcStyleCount', 'JSHeapUsedSize'];
 const diffMetrics = (a, b) => {
@@ -247,6 +279,8 @@ const session = async () => {
             argv: passArgv(process.argv.slice(2)),
             // the spare targets the scenario seeded: plan.mjs never pools sessions seeded differently
             spares: SPARES,
+            // the power source at the start (and powerEnd at the end): aggregate never pools AC and battery sessions
+            power: powerState(),
             host: { cpu: os.cpus()[0] && os.cpus()[0].model, ncpu: os.cpus().length, memGiB: Math.round(os.totalmem() / 1073741824), os: `${os.platform()} ${os.release()}`, node: process.version, load: loadavg() },
             browser: L.version,
         },
@@ -266,6 +300,8 @@ const session = async () => {
 
     try {
         sideLog('open', L.base, out.meta.build, JSON.stringify(cfg));
+        sideLog(`power: ${out.meta.power.text}${out.meta.power.ok ? '' : ' — not what users time on: plan.mjs waits for AC power before timing and control sessions'}`);
+        if (ALT_INJECT && (K - WARMUP) % 4) sideLog(`alt-inject: ${K - WARMUP} measured iterations are not whole ABBA blocks (0 I I 0) — the naive landing keeps part of any in-session climb; the landing paired with neighbours, which the verdict reads, does not depend on it (k = warm-up + a multiple of 4 balances both)`);
         await L.open();
         await page.waitForFunction(() => window.__A && window.__H && (window.__A.ready ? window.__A.ready() : !!window.__H.store()), null, { timeout: 90000 });
         progress({ stage: 'seed' });
@@ -432,7 +468,10 @@ const session = async () => {
                 const profiling = PROFILE_AT === i && rate === RATES[0];
                 // warm-up = the iterations aggregate discards; the measured ones wait for a performance core
                 const stage = profiling ? 'profile' : i < WARMUP ? 'warm-up' : 'measure';
-                const inject = ALT_INJECT ? (i % 2 ? ALT_INJECT : 0) : Number(cfg.inject || 0);
+                const inject = injectAt(i);
+                // when this iteration started and how long it waited for performance cores: plan.mjs's
+                // first-iteration check counts the rest
+                progress({ iterStartedAt: new Date(ti).toISOString(), iterGateMs: 0 });
                 let budgetMs = PCORE.maxWaitMs;
                 let waitMs = 0;
                 let ready = 0;
@@ -449,7 +488,7 @@ const session = async () => {
                         waitMs += gate.waitMs;
                         ready += gate.attempts;
                         P.gateWaitMs += gate.waitMs;
-                        progress({ stage, gate: null });
+                        progress({ stage, gate: null, iterGateMs: waitMs });
                         // no measurement off the performance cores: a gate that cannot be met ends the session
                         if (gate.timeout) throw new Error(`no performance core for ${SESSION} ${rate}x it ${i + 1}/${K}: ${gate.reason} — the session stops rather than measure there (plan.mjs --retries runs it again)`);
                         if (gate.waitMs >= 1000) sideLog(`${rate}x it ${i + 1}/${K}: waited ${dur(gate.waitMs)} for a performance core · ${gate.attempts} ready checks, the last ${Math.round(gate.check.share * 100)} % on P at ${gate.check.ghz} GHz`);
@@ -490,12 +529,14 @@ const session = async () => {
                             if (ph.node) {
                                 await ev(() => window.__H.windowStart());
                                 pending = ph.node(Object.assign({ it }, ctxBase));
-                                const own = await withTimeout(Promise.race([pending, stopped.promise]), PHASE_TIMEOUT, `phase ${ph.name}`);
+                                const own = await withTimeout(Promise.race([pending, stopped.promise]), PHASE_TIMEOUT, ph.name);
                                 r = Object.assign(await ev(() => window.__H.windowEnd()), own || {});
                             } else {
-                                r = await withTimeout(ev(([name, x]) => window.__H.runPhase(name, x), [ph.name, it]), PHASE_TIMEOUT, `phase ${ph.name}`);
+                                r = await withTimeout(ev(([name, x]) => window.__H.runPhase(name, x), [ph.name, it]), PHASE_TIMEOUT, ph.name);
                             }
                             if (hit) break;
+                            // the phase gave up on the runner's budget itself (H.RUN.phaseTimeoutMs): a phase timeout too
+                            if (r && r.timedOut) throw new PhaseTimeout(ph.name, PHASE_TIMEOUT, String(r.timedOut));
                             rec.phases[ph.name] = Object.assign(r, diffMetrics(m0, await metrics()));
                             if (r.error) break;
                         }
@@ -575,6 +616,8 @@ const session = async () => {
         }
         await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 });
         out.end = await ev(() => (window.__A.verify ? window.__A.verify() : null));
+        out.meta.powerEnd = powerState();
+        if (powerKey(out.meta.powerEnd) !== powerKey(out.meta.power)) sideLog(`power changed during the session: ${out.meta.power.text} → ${out.meta.powerEnd.text} — aggregate will not pool it with sessions on one source`);
         out.complete = true;
         out.meta.finished = new Date().toISOString();
         save();
@@ -582,8 +625,11 @@ const session = async () => {
         sideLog('written', outFile);
     } catch (e) {
         // the record keeps why the session failed (e.g. a renderer that keeps landing on efficiency cores)
+        if (e instanceof PhaseTimeout) out.failure = { kind: 'phase-timeout', phase: e.phase, ms: e.ms, detail: e.detail };
         if (!out.error) {
             out.error = String(e.message || e).split('\n')[0];
+            save();
+        } else if (out.failure) {
             save();
         }
         throw e;
@@ -594,8 +640,9 @@ const session = async () => {
 };
 
 await main().catch(e => {
+    const timeout = e instanceof PhaseTimeout;
     // an interrupted session fails on the closed browser next: keep the cause
-    if (P.stage !== 'interrupted') progress({ stage: 'failed', error: String(e?.message ?? e).split('\n')[0].slice(0, 300) });
+    if (P.stage !== 'interrupted') progress({ stage: 'failed', error: String(e?.message ?? e).split('\n')[0].slice(0, 300), failure: timeout ? { kind: 'phase-timeout', phase: e.phase, ms: e.ms, detail: e.detail } : null }, true);
     console.error(e?.stack ?? e);
-    process.exit(1);
+    process.exit(timeout ? PHASE_TIMEOUT_EXIT : 1);
 });

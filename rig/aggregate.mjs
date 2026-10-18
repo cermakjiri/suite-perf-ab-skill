@@ -3,9 +3,30 @@
  * table per pass and CPU rate.
  *
  *   node aggregate.mjs --run=<name|dir> [--passes=main,ctl] [--print=main] [--warmup=<n>] [--all]
- *        [--allow-mixed-builds]
+ *        [--brief] [--allow-mixed-builds] [--allow-mixed-power]
  *
  * --passes limits what is summarized (default: every pass in out/), --print only what is printed.
+ * --brief (what plan.mjs prints at its end) changes only the console: per timing pass x rate every
+ * headline metric as one line (Δ of the session medians, the session medians, verdict, p), every
+ * other separated metric as one line, the drift; per control session its landing (paired with
+ * neighbours, the trend fit, the naive one); counts that differ; one env line per side (commit ✓, profile, performance cores,
+ * power); the advice and next lines. summary.json and the report keep everything.
+ *
+ * Power: every session records its power source (run.mjs meta.power / powerEnd). A timing pass
+ * whose sessions ran on AC and on battery (or in Low Power Mode, or changed mid-session) is refused
+ * (exit 2, no summary) — the cores run at other clocks; --allow-mixed-power pools them with a warning.
+ *
+ * Paired control: a session's landing pairs every injected iteration with its plain neighbours on
+ * the phases the cost was injected into (control[].neighbour: the interpolation between the nearest
+ * plain iteration before and after it, the one neighbour at an end; the median of (injected −
+ * reference) ÷ injected) — what the verdict reads — next to the plain iterations' linear trend
+ * (control[].trend, a cross-check) and the naive median inject − median plain on total.taskMs
+ * (control[].landed). Load that climbs inside a session (history-load: +109 to +226 ms an iteration)
+ * otherwise lands on whichever iterations run later.
+ * Drift: per timing and control session the slope of the headline CPU metric over its kept iterations
+ * (ms an iteration, % of its median: sessions[].drift); a pass x rate whose median passes 1 %/it, with
+ * most sessions agreeing in sign, is consistent, and flagged (R.drift, advice.drift) only when the
+ * climb over a session, |slope| × k/2, reaches a third of the reported Δ (driftMatters).
  *
  * Builds first: every session records the commit its bundle carried (env.build, from the inlined
  * COMMITHASH / release string). A side whose sessions ran more than one commit — a deployed preview
@@ -40,7 +61,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseArgs, list, loadRun, resolveIn, readJson, tryJson, writeJson, summarize, median, permutationP, separated, importScenario, dur, CALL_P, called, minP, LANDED_PCT, controlVerdict, controlText, isMs, roleResolver, countKeys, planSessions, timingHistory, etaModel, sideCommit, sessionCommit } from './lib.mjs';
+import { parseArgs, list, loadRun, resolveIn, readJson, tryJson, writeJson, summarize, median, mean, linearFit, permutationP, separated, importScenario, dur, CALL_P, called, minP, LANDED_PCT, controlVerdict, controlText, naiveLanding, isMs, roleResolver, countKeys, planSessions, timingHistory, etaModel, sideCommit, sessionCommit, powerKey } from './lib.mjs';
 import { compilerText } from './fingerprint.mjs';
 
 const args = parseArgs();
@@ -115,6 +136,113 @@ const flatten = (rec, d) => {
 
     return o;
 };
+// ------------------------------------------------------------------ in-session trends
+// a record's place in its session's time order (n counts every attempt; older records: iter)
+const xOf = r => (Number.isInteger(r.n) ? r.n : r.iter);
+// the phases an injected iteration's cost went into, and their task time
+const injectedPhases = recs => [...new Set(recs.flatMap(r => Object.entries(r.phases || {}).filter(([, ph]) => (ph.injectedMs || 0) > 0).map(([n]) => n)))];
+const phaseTask = (r, phases) => phases.reduce((t, n) => t + ((r.phases[n] && r.phases[n].taskMs) || 0), 0);
+/**
+ * A paired control's landing against its plain neighbours (what the verdict reads): every injected
+ * iteration is compared with the plain iterations around it — the line between the nearest plain one
+ * before and after it, at its position (with 0 I 0 I their mean; with 0 I I 0 the interpolation at
+ * each I), or the one plain neighbour at an end — on the phases the cost went into; the session's
+ * landing is the median over its injected iterations of (injected − reference) ÷ what it injected.
+ * Slow variation (a climb, warm-up, machine state) cancels pair by pair. Measured: drift-hl-fix
+ * ctlnr-1-A / -2-A land at 106 / 109 % this way, where median inject − median plain reads 110 / 132 %.
+ * `ok`: the session's measured iterations of one rate, plain and injected.
+ */
+const neighbourLanding = ok => {
+    const recs = ok.toSorted((a, b) => xOf(a) - xOf(b));
+    const phases = injectedPhases(recs.filter(r => r.inject));
+    if (!phases.length) return null;
+    const pcts = [];
+    for (const [i, r] of recs.entries()) {
+        if (!r.inject) continue;
+        const before = recs.slice(0, i).findLast(x => !x.inject);
+        const after = recs.slice(i + 1).find(x => !x.inject);
+        if (!before && !after) continue;
+        const ref = !before ? phaseTask(after, phases) : !after ? phaseTask(before, phases)
+            : phaseTask(before, phases) + ((phaseTask(after, phases) - phaseTask(before, phases)) * (xOf(r) - xOf(before))) / (xOf(after) - xOf(before));
+        const injected = phases.reduce((t, n) => t + ((r.phases[n] && r.phases[n].injectedMs) || 0), 0);
+        if (injected) pcts.push(((phaseTask(r, phases) - ref) / injected) * 100);
+    }
+
+    return pcts.length ? { metric: `${phases.join('+')}.taskMs`, phases, landedPct: Math.round(median(pcts)), pairs: pcts.length, pcts: pcts.map(p => Math.round(p)) } : null;
+};
+/**
+ * The cross-check: the plain iterations' linear trend — a line through the plain iterations' task
+ * time on the phases the cost went into, the injected iterations' residuals from it averaged, as a %
+ * of what they injected. Load that climbs from one iteration to the next lands on an injected
+ * iteration that runs a step later than its plain partner; the naive landing (median inject − median
+ * plain, total.taskMs) counts that climb as landed cost. null under 2 plain iterations.
+ */
+const trendLanding = (plain, injected) => {
+    const phases = injectedPhases(injected);
+    if (!phases.length || plain.length < 2 || !injected.length) return null;
+    const fit = linearFit(plain.map(xOf), plain.map(r => phaseTask(r, phases)));
+    if (!fit) return null;
+    const deltaMs = mean(injected.map(r => phaseTask(r, phases) - (fit.intercept + fit.slope * xOf(r))));
+    const expectedMs = mean(injected.map(r => phases.reduce((t, n) => t + ((r.phases[n] && r.phases[n].injectedMs) || 0), 0)));
+    const naive = median(injected.map(r => phaseTask(r, phases))) - median(plain.map(r => phaseTask(r, phases)));
+    const pctOf = v => (expectedMs ? Math.round((v / expectedMs) * 100) : null);
+
+    return { metric: `${phases.join('+')}.taskMs`, phases, deltaMs: +deltaMs.toFixed(1), expectedMs: +expectedMs.toFixed(1), landedPct: pctOf(deltaMs), naivePct: pctOf(naive), slopeMsPerIter: +fit.slope.toFixed(1) };
+};
+// in-session drift: the slope of the headline CPU metric over a session's kept iterations (ms per
+// iteration and % of the session's median); a pass x rate whose sessions' median drift passes
+// DRIFT_PCT per iteration is flagged — state that builds up inside a session (a control's pairing
+// and a verdict at another k depend on it)
+const DRIFT_PCT = 1;
+const DRIFT_KEY = ((scenario.headline || []).map(h => h.key).find(k => /(taskMs|taskCorrMs|cpuMs|CpuMs)$/.test(k))) || 'total.taskMs';
+/**
+ * Whether a consistent drift can matter: the climb over a session, |median slope| × k/2 (how far the
+ * session median sits from where the session started), reaches a third of what the pass reports —
+ * for a timing pass the largest |Δ| (ms, between the sides' session medians) among its called
+ * headline metrics, or the drift metric's own Δ when none is called; for a control pass the injected
+ * cost. Below that the slope is information only (R.drift.flagged false, matters false).
+ * coinjoin-address-stats main @ 1x: +0.2 ms/it × 4 = 0.8 ms against info.ms −92 ms: information.
+ * pr33507 h40 @ 4x: +155 ms/it × 4 = 620 ms against load.ms −430 ms: flagged.
+ */
+const DRIFT_SHARE = 1 / 3;
+const driftMatters = (R, P) => {
+    const d = R.drift;
+    const sides = Object.keys(R.sides);
+    const deltaMs = key => {
+        const m = R.metrics[key];
+        const [a, b] = sides;
+        const A = m && m[a] && median(m[a].sessions);
+        const B = m && m[b] && median(m[b].sessions);
+
+        return typeof A === 'number' && typeof B === 'number' ? Math.abs(B - A) : null;
+    };
+    const k = Number((P.meta && P.meta.k) || 0);
+    d.climbMs = +((Math.abs(d.medianMsPerIter) * k) / 2).toFixed(1);
+    if (P.role === 'control') {
+        const exp = median(Object.values(R.control || {}).flat().map(c => c.expectedMs).filter(Number.isFinite));
+        d.ref = exp === null ? null : { key: 'injected cost', ms: +exp.toFixed(1) };
+    } else {
+        const heads = (scenario.headline || []).map(h => h.key);
+        const keys = (heads.length ? heads : Object.keys(R.metrics).filter(x => /^[^.]+\.(ms|taskMs)$|^total\.taskMs$/.test(x))).filter(x => isMs(x) && R.metrics[x] && called(R.metrics[x].delta));
+        const best = keys.map(key => ({ key, ms: deltaMs(key) })).filter(x => x.ms !== null).toSorted((x, y) => y.ms - x.ms)[0];
+        const own = deltaMs(d.key);
+        d.ref = best ? { key: best.key, ms: +best.ms.toFixed(1), called: true } : own === null ? null : { key: d.key, ms: +own.toFixed(1), called: false };
+    }
+    d.share = DRIFT_SHARE;
+    d.matters = !d.ref || d.climbMs >= d.ref.ms * DRIFT_SHARE;
+    d.flagged = d.consistent && d.matters;
+};
+const driftOf = (recs, flat) => {
+    const pts = recs.map((r, i) => [xOf(r), flat[i][DRIFT_KEY]]).filter(([x, y]) => Number.isFinite(x) && typeof y === 'number' && Number.isFinite(y));
+    // two points make a difference, not a slope
+    if (pts.length < 3) return null;
+    const fit = linearFit(pts.map(p => p[0]), pts.map(p => p[1]));
+    const med = median(pts.map(p => p[1]));
+    if (!fit || !med) return null;
+
+    return { slopeMs: +fit.slope.toFixed(1), pctPerIter: +((fit.slope / med) * 100).toFixed(2), n: pts.length };
+};
+
 // shown in every table next to the headline: how much of the main thread's CPU ran on efficiency cores
 const PLACEMENT = 'pcore.eSharePct';
 // the advice flags a placement difference between the sides of at least this many points (sessions separate)
@@ -145,6 +273,15 @@ const summary = {
 };
 // the commit every session ran, per side (all passes): one build per side, or no summary
 const ranOn = {};
+// a session's power source: 'ac', 'battery', '+lowpower', 'mixed' when it changed during the session, null when unrecorded
+const powerOf = meta => {
+    const a = powerKey(meta && meta.power);
+    const b = meta && meta.powerEnd ? powerKey(meta.powerEnd) : a;
+
+    return a && b && a !== b ? 'mixed' : a || b || null;
+};
+// timing passes whose sessions ran on different power sources: refused below, like mixed builds
+const mixedPower = [];
 
 for (const passName of passes) {
     const sess = all.filter(s => s.pass === passName).sort((a, b) => a.n - b.n);
@@ -157,10 +294,16 @@ for (const passName of passes) {
         loaded.push(Object.assign({ d }, s));
         const c = sessionCommit(d);
         if (c) ((ranOn[s.side] ||= {})[c] ||= []).push(s.file.replace(/\.json$/, ''));
-        (P.sessions[s.side] = P.sessions[s.side] || []).push({ id: s.file.replace(/\.json$/, ''), complete: !!d.complete, iterations: d.runs.length, started: d.meta.started, load: d.meta.host && d.meta.host.load, browser: d.meta.browser, env: d.env && { markers: Object.fromEntries(Object.entries(d.env.markers || {}).filter(([n]) => !/^[0-9a-f]{40}$/.test(n))), coverageFiles: d.env.coverageFiles, renderers: d.env.renderers, canary: d.env.canary, desktopLaunches: d.env.desktopLaunches, build: d.env.build || null, discovery: d.env.discovery || null, pageHook: d.env.pageHook || null }, commit: sessionCommit(d), calib: d.calib, idle: Object.fromEntries(Object.entries(d.idle || {}).map(([r, i]) => [r, { taskPerS: i.ms ? +(i.taskMs / (i.ms / 1000)).toFixed(1) : null, commits: i.commits }])), pcore: d.meta.pcore ? { enabled: d.meta.pcore.enabled, reason: d.meta.pcore.reason, waitMs: d.meta.pcore.gateWaitMs, discards: d.meta.pcore.discards.length, kept: d.meta.pcore.kept.length } : null, error: d.error || null });
+        (P.sessions[s.side] = P.sessions[s.side] || []).push({ id: s.file.replace(/\.json$/, ''), complete: !!d.complete, iterations: d.runs.length, started: d.meta.started, load: d.meta.host && d.meta.host.load, power: powerOf(d.meta), browser: d.meta.browser, env: d.env && { markers: Object.fromEntries(Object.entries(d.env.markers || {}).filter(([n]) => !/^[0-9a-f]{40}$/.test(n))), coverageFiles: d.env.coverageFiles, renderers: d.env.renderers, canary: d.env.canary, desktopLaunches: d.env.desktopLaunches, build: d.env.build || null, discovery: d.env.discovery || null, pageHook: d.env.pageHook || null }, commit: sessionCommit(d), calib: d.calib, idle: Object.fromEntries(Object.entries(d.idle || {}).map(([r, i]) => [r, { taskPerS: i.ms ? +(i.taskMs / (i.ms / 1000)).toFixed(1) : null, commits: i.commits }])), pcore: d.meta.pcore ? { enabled: d.meta.pcore.enabled, reason: d.meta.pcore.reason, waitMs: d.meta.pcore.gateWaitMs, discards: d.meta.pcore.discards.length, kept: d.meta.pcore.kept.length } : null, error: d.error || null });
         if (!P.meta) P.meta = { k: d.meta.k, rates: d.meta.rates, warmup: d.meta.warmup, idleMs: d.meta.idleMs, cfg: d.meta.cfg, altInject: d.meta.altInject, target: d.meta.target, device: d.meta.device, scenario: d.meta.scenario };
     }
     P.role = roleOf(passName, P.meta);
+    // AC and battery (or Low Power Mode) clock the cores differently: one timing pass, one power source
+    if (P.role === 'timing') {
+        const by = Object.groupBy(Object.values(P.sessions).flat().filter(x => x.power), x => x.power);
+        if (Object.keys(by).length > 1) mixedPower.push(`${passName} ran on ${Object.entries(by).map(([k, l]) => `${k} (${l.map(x => x.id).join(', ')})`).join(' and ')}`);
+        else if (by.battery || Object.keys(by).some(k => k.includes('lowpower'))) warnings.push(`${passName} ran ${by.battery ? 'on battery' : 'in Low Power Mode'} — not how the cores run on AC power; measure on AC (plan.mjs waits for it)`);
+    }
     if (GATED_ROLES.includes(P.role)) {
         for (const s of loaded) {
             if (!s.d.meta.pcore) continue;
@@ -194,9 +337,10 @@ for (const passName of passes) {
                 const base = ok.filter(r => !r.inject);
                 const flat = base.map(r => flatten(r, s.d));
                 kept.push(...flat);
-                sessionsVals.push({ id: s.file.replace(/\.json$/, ''), flat, load1m: median(recs.map(r => r.load1m)) });
+                sessionsVals.push({ id: s.file.replace(/\.json$/, ''), flat, load1m: median(recs.map(r => r.load1m)), drift: ['timing', 'control'].includes(P.role) ? driftOf(base, flat) : null });
                 if (s.d.meta.altInject) {
-                    const inj = ok.filter(r => r.inject).map(r => ({ f: flatten(r, s.d), r }));
+                    const injRecs = ok.filter(r => r.inject);
+                    const inj = injRecs.map(r => ({ f: flatten(r, s.d), r }));
                     const keys = Object.keys(flat[0] || {}).filter(k => /\.taskMs$/.test(k) || k === 'total.taskMs');
                     const expected = median(inj.map(x => Object.values(x.r.phases).reduce((t, ph) => t + (ph.injectedMs || 0), 0)));
                     const landed = {};
@@ -204,13 +348,24 @@ for (const passName of passes) {
                         const dlt = median(inj.map(x => x.f[k])) - median(flat.map(x => x[k]));
                         landed[k] = { deltaMs: +dlt.toFixed(1), landedPct: expected ? +((dlt / expected) * 100).toFixed(0) : null };
                     }
-                    // pairs: inject / no-inject iterations; under 3 a session's landing is mostly noise
-                    control.push({ session: s.file.replace(/\.json$/, ''), injectMs: s.d.meta.altInject, expectedMs: expected, pairs: Math.min(inj.length, flat.length), landed });
+                    // pairs: inject / no-inject iterations; under 3 a session's landing is mostly noise. `landed`:
+                    // the naive landing per phase; `trend`: against the plain iterations' line (the verdict's)
+                    // seq: the measured iterations' order, 0 plain / I injected (ABBA since the rig paired them so: 0II00II0)
+                    control.push({ session: s.file.replace(/\.json$/, ''), injectMs: s.d.meta.altInject, expectedMs: expected, pairs: Math.min(inj.length, flat.length), seq: ok.map(r => (r.inject ? 'I' : '0')).join(''), landed, neighbour: neighbourLanding(ok), trend: trendLanding(base, injRecs) });
                 }
             }
             perSide[side] = { kept, sessionsVals };
-            R.sides[side] = { n: kept.length, total, problems, sessions: sessionsVals.map(v => ({ id: v.id, kept: v.flat.length, load1m: v.load1m })) };
+            R.sides[side] = { n: kept.length, total, problems, sessions: sessionsVals.map(v => ({ id: v.id, kept: v.flat.length, load1m: v.load1m, drift: v.drift })) };
             if (control.length) (R.control = R.control || {})[side] = control;
+        }
+        // drift of the headline CPU metric inside the sessions of a timing or control pass
+        const drifts = sides.flatMap(side => perSide[side].sessionsVals.filter(v => v.drift).map(v => Object.assign({ id: v.id, side }, v.drift)));
+        if (drifts.length) {
+            const med = median(drifts.map(d => d.pctPerIter));
+            // one session's slope over 3-6 points is noisy: flag a median past the threshold that most sessions share in sign
+            const along = drifts.filter(d => Math.sign(d.pctPerIter) === Math.sign(med)).length / drifts.length;
+            // consistent: past DRIFT_PCT a iteration, most sessions agreeing; flagged below only when it can matter
+            R.drift = { key: DRIFT_KEY, thresholdPct: DRIFT_PCT, medianPctPerIter: +med.toFixed(2), medianMsPerIter: +median(drifts.map(d => d.slopeMs)).toFixed(1), sameSign: +along.toFixed(2), consistent: Math.abs(med) > DRIFT_PCT && along >= 0.75, flagged: false, over: drifts.filter(d => Math.abs(d.pctPerIter) > DRIFT_PCT).map(d => d.id) };
         }
         const keys = [...new Set(sides.flatMap(side => perSide[side].kept.flatMap(o => Object.keys(o))))].sort();
         for (const k of keys) {
@@ -235,6 +390,7 @@ for (const passName of passes) {
             }
             R.metrics[k] = m;
         }
+        if (R.drift) driftMatters(R, P);
         P.rates[rate] = R;
     }
     summary.passes[passName] = P;
@@ -265,6 +421,14 @@ if (mixed.length) {
         process.exit(2);
     }
     warnings.push(...mixed.map(m => `mixed builds pooled (--allow-mixed-builds): ${m}`));
+}
+if (mixedPower.length) {
+    if (!args.allowMixedPower) {
+        for (const m of mixedPower) console.error(`refused: timing pass ${m}`);
+        console.error('AC and battery (or Low Power Mode) sessions are not pooled into one timing pass: the cores run at other clocks. Run the minority sessions again on AC power (move their records out of out/; plan.mjs waits for AC before timing), or pool them anyway with --allow-mixed-power (with a warning in the report).');
+        process.exit(2);
+    }
+    warnings.push(...mixedPower.map(m => `mixed power pooled (--allow-mixed-power): ${m}`));
 }
 
 // ------------------------------------------------------------------ page tools
@@ -371,6 +535,20 @@ const failedCtl = advice.controls.filter(c => c.state === 'failed');
 advice.next.push(...failedCtl.map(c => `fix the rig before adding sessions — the paired control ${c.pass} @ ${c.rate}x did not land (sessions ${c.range[0]}–${c.range[1]} %, median ${c.median} %; want ${LANDED_PCT[0]}–${LANDED_PCT[1]} %)`), ...blocks);
 if (!judged.length) advice.next.push(names.some(p => role(p) === 'timing') ? 'no timing pass has 2+ sessions a side yet — run a session block before judging' : `run the timing passes (plan.mjs --run=${RUN_ID})`);
 else if (!blocks.length && !failedCtl.length) advice.next.push('the draft is stable — more sessions would not change any verdict');
+// in-session drift past DRIFT_PCT a iteration (median of the sessions): load that builds up inside a session
+advice.drift = [];
+for (const name of names.filter(p => ['timing', 'control'].includes(role(p)))) {
+    for (const [rate, R] of Object.entries(summary.passes[name].rates)) {
+        const d = R.drift;
+        if (!d || !d.flagged) continue;
+        const n = Object.values(R.sides).reduce((t, s) => t + s.sessions.filter(x => x.drift).length, 0);
+        advice.drift.push({
+            pass: name, rate: Number(rate), key: d.key, medianPctPerIter: d.medianPctPerIter, medianMsPerIter: d.medianMsPerIter,
+            climbMs: d.climbMs, ref: d.ref,
+            text: `${name} @ ${rate}x: ${d.key} drifts ${d.medianPctPerIter > 0 ? '+' : ''}${d.medianPctPerIter} % a iteration inside the sessions (${d.medianMsPerIter > 0 ? '+' : ''}${d.medianMsPerIter} ms/it, median; ${d.over.length} of ${n} sessions past ${DRIFT_PCT} %), ${d.climbMs} ms over a session${d.ref ? ` against the ${d.ref.key}${d.ref.key === 'injected cost' ? '' : ' Δ'} ${d.ref.ms} ms` : ''} — something builds up per iteration: the session medians hold for this k${role(name) === 'control' ? '; the control verdict pairs each injected iteration with its neighbours' : ''}`,
+        });
+    }
+}
 summary.advice = advice;
 summary.warnings = warnings;
 // the performance-core gate per side (gated passes only): wait, discards (by cause), per CPU rate the
@@ -417,50 +595,143 @@ const cell = x => (x && x.stats ? `${fmt(x.stats.p50)}/${fmt(x.stats.p75)} [${fm
 const sessStr = x => (x && x.sessions ? x.sessions.map(fmt).join(' ') : '');
 const headKeys = (summary.headline || []).map(h => h.key);
 const printOnly = list(args.print);
-for (const [name, P] of Object.entries(summary.passes)) {
-    if (printOnly.length && !printOnly.includes(name)) continue;
-    const counts = P.role === 'counts';
-    for (const [rate, R] of Object.entries(P.rates)) {
-        const sides = Object.keys(R.sides);
-        console.log(`\n### ${name} @ ${rate}x — kept ${sides.map(s => `${s} ${R.sides[s].n}/${R.sides[s].total} in ${R.sides[s].sessions.length} sessions`).join(', ')}${counts ? ' — counts (instrumented: no timing claims)' : ''}`);
-        const shown = args.all ? Object.keys(R.metrics) : counts ? countKeys(R, summary.headline) : headKeys.length ? headKeys.filter(k => R.metrics[k]) : Object.keys(R.metrics).filter(k => k.startsWith('total.'));
-        const show = shown.concat(!shown.includes(PLACEMENT) && R.metrics[PLACEMENT] ? [PLACEMENT] : []);
-        // anything else whose sessions separate (p <= 0.1 needs 5+ sessions in total) by 5% or more
-        const extra = args.all || counts ? [] : Object.keys(R.metrics).filter(k => {
-            const d = R.metrics[k].delta;
+const sgnP = v => (v === null || v === undefined ? '' : `${v > 0 ? '+' : ''}${v}%`);
+const shownKeys = (R, counts) => {
+    const shown = args.all ? Object.keys(R.metrics) : counts ? countKeys(R, summary.headline) : headKeys.length ? headKeys.filter(k => R.metrics[k]) : Object.keys(R.metrics).filter(k => k.startsWith('total.'));
 
-            return !show.includes(k) && !k.startsWith('pcore.') && d && d.separated && d.separated !== 'overlap' && d.p !== null && d.p <= 0.1 && Math.abs(d.medPct || 0) >= 5;
-        });
-        console.log('metric'.padEnd(26), `${sides[0]} p50/p75 [min–max]`.padEnd(30), `${sides[1] || ''} p50/p75 [min–max]`.padEnd(30), 'Δp75'.padEnd(8), 'Δmed'.padEnd(8), 'sessions (A | B)  verdict p');
-        for (const k of show.concat(extra.length ? ['—', ...extra] : [])) {
-            if (k === '—') {
-                console.log('  also separated (p <= 0.1, |Δmed| >= 5%):');
+    return shown.concat(!shown.includes(PLACEMENT) && R.metrics[PLACEMENT] ? [PLACEMENT] : []);
+};
+// anything else whose sessions separate (p <= 0.1 needs 5+ sessions in total) by 5% or more
+const extraKeys = (R, show) => Object.keys(R.metrics).filter(k => {
+    const d = R.metrics[k].delta;
+
+    return !show.includes(k) && !k.startsWith('pcore.') && d && d.separated && d.separated !== 'overlap' && d.p !== null && d.p <= 0.1 && Math.abs(d.medPct || 0) >= 5;
+});
+const controlLine = (side, c) => {
+    const naive = naiveLanding(c);
+    const nb = c.neighbour;
+    const t = c.trend;
+    if (!nb && !t) return `control ${side} ${c.session}: +${c.injectMs} ms x calls = ${fmt(c.expectedMs)} ms expected, total.taskMs moved ${naive ?? '–'}%`;
+
+    return `control ${side} ${c.session}${c.seq ? ` (${c.seq})` : ''}: ${nb ? `${nb.landedPct} % paired with neighbours on ${nb.metric} (${nb.pairs}: ${nb.pcts.join(' ')})` : 'no neighbour pairs'} · trend fit ${t ? `${t.landedPct ?? '–'} % (${fmt(t.deltaMs)} of ${fmt(t.expectedMs)} ms; plain trend ${t.slopeMsPerIter > 0 ? '+' : ''}${t.slopeMsPerIter} ms/it)` : '–'} · naive ${naive ?? '–'} % on total.taskMs`;
+};
+const signed = v => `${v > 0 ? '+' : ''}${v}`;
+const driftLine = (R, short = false) => {
+    const d = R.drift;
+    if (!d) return null;
+    const per = side => R.sides[side].sessions.map(x => (x.drift ? signed(+x.drift.pctPerIter.toFixed(1)) : '–')).join(' ');
+    const vs = d.ref ? `${d.climbMs} ms over a session ${d.flagged ? '≥' : '<'} ⅓ of the ${d.ref.key} ${d.ref.key === 'injected cost' ? '' : 'Δ '}${d.ref.ms} ms` : `${d.climbMs} ms over a session`;
+    const flag = d.flagged ? (short ? ` FLAG: ${vs}` : ` — FLAG: the load builds up inside the sessions, ${vs}`) : d.consistent ? ` (information: ${vs})` : '';
+
+    const ms = Math.abs(d.medianMsPerIter) >= 10 ? Math.round(d.medianMsPerIter) : d.medianMsPerIter;
+
+    return `drift ${d.key} %/it${short ? '' : ' (slope / session median)'}: ${Object.keys(R.sides).map(s => `${s} ${per(s)}`).join(' | ')} · median ${signed(d.medianPctPerIter)}${short ? '' : ' %/it'} (${signed(ms)} ms/it)${flag}`;
+};
+const pText = p => (p === null || p === undefined ? '–' : String(+p.toFixed(3)));
+const tables = () => {
+    for (const [name, P] of Object.entries(summary.passes)) {
+        if (printOnly.length && !printOnly.includes(name)) continue;
+        const counts = P.role === 'counts';
+        for (const [rate, R] of Object.entries(P.rates)) {
+            const sides = Object.keys(R.sides);
+            console.log(`\n### ${name} @ ${rate}x — kept ${sides.map(s => `${s} ${R.sides[s].n}/${R.sides[s].total} in ${R.sides[s].sessions.length} sessions`).join(', ')}${counts ? ' — counts (instrumented: no timing claims)' : ''}`);
+            const show = shownKeys(R, counts);
+            const extra = args.all || counts ? [] : extraKeys(R, show);
+            console.log('metric'.padEnd(26), `${sides[0]} p50/p75 [min–max]`.padEnd(30), `${sides[1] || ''} p50/p75 [min–max]`.padEnd(30), 'Δp75'.padEnd(8), 'Δmed'.padEnd(8), 'sessions (A | B)  verdict p');
+            for (const k of show.concat(extra.length ? ['—', ...extra] : [])) {
+                if (k === '—') {
+                    console.log('  also separated (p <= 0.1, |Δmed| >= 5%):');
+                    continue;
+                }
+                const m = R.metrics[k];
+                const d = m.delta || {};
+                console.log(k.padEnd(26), cell(m[sides[0]]).padEnd(30), cell(m[sides[1]]).padEnd(30), sgnP(d.p75Pct).padEnd(8), sgnP(d.medPct).padEnd(8), `${sessStr(m[sides[0]])} | ${sessStr(m[sides[1]])}  ${d.separated || ''} ${d.p ?? ''}`);
+            }
+            const dl = driftLine(R);
+            if (dl) console.log(`  ${dl}`);
+            for (const [side, list_] of Object.entries(R.control || {})) for (const c of list_) console.log(`  ${controlLine(side, c)}`);
+            for (const side of sides) for (const p of R.sides[side].problems.slice(0, 5)) console.log('  problem', p);
+        }
+    }
+};
+// the same verdicts in ~1.5k tokens: per timing pass x rate every headline metric (Δ of the session
+// medians, the session medians, verdict, p), every other separated metric, the drift; per control
+// session its landing; counts that differ; one env line per side. summary.json keeps everything
+const brief = () => {
+    const med = x => (x && x.sessions ? x.sessions.map(fmt).join(' ') : '–');
+    for (const [name, P] of Object.entries(summary.passes)) {
+        if (printOnly.length && !printOnly.includes(name)) continue;
+        for (const [rate, R] of Object.entries(P.rates)) {
+            const sides = Object.keys(R.sides);
+            const kept = sides.map(s => `${s} ${R.sides[s].sessions.length}s ${R.sides[s].n}/${R.sides[s].total}`).join(', ');
+            if (P.role === 'counts') {
+                const diff = countKeys(R, summary.headline).filter(k => new Set(sides.map(s => (R.metrics[k][s] && R.metrics[k][s].stats ? R.metrics[k][s].stats.p50 : null))).size > 1);
+                console.log(`## ${name} @ ${rate}x · counts (${kept}): ${diff.length ? diff.map(k => `${k} ${sides.map(s => fmt(R.metrics[k][s] && R.metrics[k][s].stats && R.metrics[k][s].stats.p50)).join('→')}`).join(', ') : 'every count the same on both sides'}`);
                 continue;
             }
-            const m = R.metrics[k];
-            const d = m.delta || {};
-            const sgn = v => (v === null || v === undefined ? '' : `${v > 0 ? '+' : ''}${v}%`);
-            console.log(k.padEnd(26), cell(m[sides[0]]).padEnd(30), cell(m[sides[1]]).padEnd(30), sgn(d.p75Pct).padEnd(8), sgn(d.medPct).padEnd(8), `${sessStr(m[sides[0]])} | ${sessStr(m[sides[1]])}  ${d.separated || ''} ${d.p ?? ''}`);
-        }
-        if (R.control) {
-            for (const [side, list_] of Object.entries(R.control)) {
-                for (const c of list_) {
-                    const t = c.landed['total.taskMs'] || Object.values(c.landed)[0] || {};
-                    console.log(`  control ${side} ${c.session}: +${c.injectMs} ms x calls = ${fmt(c.expectedMs)} ms expected, total.taskMs moved ${fmt(t.deltaMs)} ms = ${t.landedPct ?? '–'}%`);
+            if (P.role === 'trial') {
+                const keys = (headKeys.length ? headKeys : ['total.taskMs']).filter(k => R.metrics[k]).slice(0, 2);
+                console.log(`## ${name} @ ${rate}x · trial, not judged (${kept}): ${keys.map(k => `${k} ${sides.map(s => `${s} ${med(R.metrics[k][s])}`).join(' | ')}`).join(' · ')}`);
+                continue;
+            }
+            console.log(`## ${name} @ ${rate}x · ${P.role} (${kept})`);
+            if (P.role === 'timing') {
+                const show = shownKeys(R, false);
+                // the placement share stays in the full tables; a difference between the sides is a flag below
+                for (const k of show.filter(x => x !== PLACEMENT)) {
+                    const m = R.metrics[k];
+                    const d = m.delta || {};
+                    console.log(`${k} ${sgnP(d.medPct) || '–'} · ${sides.map(s => med(m[s])).join(' | ')} · ${d.separated || '–'} p ${pText(d.p)}`);
+                }
+                for (const k of extraKeys(R, show)) {
+                    const d = R.metrics[k].delta;
+                    console.log(`also ${k} ${sgnP(d.medPct)} ${d.separated} p ${pText(d.p)}`);
                 }
             }
+            const v = R.control ? controlVerdict(R.control) : null;
+            if (v) console.log(controlText(v));
+            for (const [side, list_] of Object.entries(R.control || {})) {
+                console.log(`${side}: ${list_.map(c => `${c.session} ${c.neighbour ? `${c.neighbour.landedPct}%` : '–'} (trend ${c.trend && c.trend.landedPct !== null ? `${c.trend.landedPct}%` : '–'}, naive ${naiveLanding(c) ?? '–'}%)`).join(' · ')}`);
+            }
+            const dl = driftLine(R, true);
+            if (dl) console.log(dl);
+            const problems = sides.reduce((t, s) => t + R.sides[s].problems.length, 0);
+            if (problems) console.log(`problems: ${problems} iterations dropped (${sides.flatMap(s => R.sides[s].problems).slice(0, 2).join('; ').slice(0, 200)})`);
         }
-        for (const side of sides) for (const p of R.sides[side].problems.slice(0, 5)) console.log('  problem', p);
     }
+    // env, one line per side: the commit check, profile, performance cores, power
+    for (const [k, side] of Object.entries(summary.run.sides)) {
+        const sess = Object.values(summary.passes).flatMap(p => p.sessions[k] || []);
+        const withBuild = sess.filter(x => x.env && x.env.build);
+        const ok = withBuild.filter(x => x.env.build.verified === true || x.env.build.verified === 'offline').length;
+        const c = side.commit || sideCommit(run.sides[k]);
+        const g = summary.pcore[k];
+        const e4 = g && (g.rates['4'] || Object.values(g.rates)[0]);
+        const power = Object.entries(Object.groupBy(sess.filter(x => x.power), x => x.power)).map(([p, l]) => `${p} ${l.length}`).join(', ') || 'unrecorded';
+        console.log(`env ${k}: ${c ? c.slice(0, 10) : 'commit unknown'} ${withBuild.length ? (ok === withBuild.length ? `✓ ${ok}/${withBuild.length}` : `✗ ${ok}/${withBuild.length} sessions carried it`) : ''} · ${side.profile || '–'} · pcore ${g ? `${g.gated}/${g.sessions} gated, ${g.discards} discarded${e4 ? `, E ${e4.medianEPct ?? '–'} %` : ''}` : 'off'} · power ${power}`);
+    }
+};
+const adviceLines = (short = false) => {
+    console.log(`\n### advice — could more sessions change a verdict? (called: sessions separate, p ≤ ${CALL_P}; borderline: p ≤ ${BORDER_P})`);
+    for (const [name, rates] of Object.entries(advice.passes)) {
+        console.log(Object.entries(rates).map(([rate, c]) => `${name} @ ${rate}x (${c.sessions.join(' v ')}): ${['called', 'underpowered', 'borderline', 'settled'].filter(x => c[x].length).map(x => `${c[x].length} ${x}`).join(', ')}`).join(' · '));
+    }
+    // the brief has the control verdicts and the drift per pass above
+    if (!short) for (const c of advice.controls) console.log(controlText(c, `${c.pass} @ ${c.rate}x`));
+    for (const f of advice.placement) console.log(`flag: ${f.pass} @ ${f.rate}x: ${f.text}`);
+    if (!short) for (const d of advice.drift) console.log(`flag: ${d.text}`);
+    else if (advice.drift.length) console.log(`flag: in-session drift that can matter (the climb over a session reaches a third of the reported Δ) in ${advice.drift.map(d => `${d.pass} @ ${d.rate}x`).join(', ')} — something builds up per iteration: the session medians hold for this k`);
+    for (const w of warnings) console.log(`warning: ${w}`);
+    for (const l of advice.next) console.log(`next: ${l}`);
+};
+if (args.brief) {
+    brief();
+    adviceLines(true);
+    console.log(`\nsummary: ${outFile} · the full tables: aggregate.mjs --run=${RUN_ID}`);
+    process.exit(0);
 }
-console.log(`\n### advice — could more sessions change a verdict? (called: sessions separate, p ≤ ${CALL_P}; borderline: p ≤ ${BORDER_P})`);
-for (const [name, rates] of Object.entries(advice.passes)) {
-    console.log(Object.entries(rates).map(([rate, c]) => `${name} @ ${rate}x (${c.sessions.join(' v ')}): ${['called', 'underpowered', 'borderline', 'settled'].filter(x => c[x].length).map(x => `${c[x].length} ${x}`).join(', ')}`).join(' · '));
-}
-for (const c of advice.controls) console.log(controlText(c, `${c.pass} @ ${c.rate}x`));
-for (const f of advice.placement) console.log(`flag: ${f.pass} @ ${f.rate}x: ${f.text}`);
-for (const w of warnings) console.log(`warning: ${w}`);
-for (const l of advice.next) console.log(`next: ${l}`);
+tables();
+adviceLines();
 for (const [side, g] of Object.entries(summary.pcore)) {
     const perRate = Object.entries(g.rates).map(([r, x]) => `${r}x E share ${x.medianEPct ?? '–'} % median (≤ ${x.maxEPct ?? '–'} %; counted ≤ ${x.maxCountedMs} ms), P ${x.medianGHz ?? '–'} GHz`).join('; ');
     const partly = g.partly ? ` · ${g.partly} partly gated (${g.ungatedIterations} measured iterations ran ungated)` : '';

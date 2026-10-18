@@ -91,7 +91,9 @@ const launchWeb = async ({ repo, side, initScript, headed = false, cdpPort = nul
     const { chromium } = await playwright(repo);
     if (!side.web && !side.url) throw new Error(`side ${side.key} has neither a web build nor a url — run build.mjs first`);
     const base = side.web ? BASE : side.url;
-    const args = ['--js-flags=--expose-gc', '--disable-features=LocalNetworkAccessChecks'];
+    // precise memory info: without it performance.memory is bucketed and refreshed rarely (read 45.2 MiB
+    // in every iteration of every session while 26 MiB was retained), so every heap probe was dead
+    const args = ['--js-flags=--expose-gc', '--enable-precise-memory-info', '--disable-features=LocalNetworkAccessChecks'];
     if (side.web && network !== 'live') {
         const keep = ['suite.localhost'].concat(device === 'synthetic' ? [] : ['localhost', '127.0.0.1']);
         args.push(`--host-resolver-rules=MAP * ~NOTFOUND, ${keep.map(h => `EXCLUDE ${h}`).join(', ')}`);
@@ -173,6 +175,8 @@ const launchDesktop = async ({ repo, side, initScript, cdpPort = null, device = 
         `--user-data-dir=${userData}`,
         '--expose-store',
         '--js-flags=--expose-gc',
+        // as on web: performance.memory is bucketed and nearly frozen without it
+        '--enable-precise-memory-info',
         `--width=${viewport.width}`,
         `--height=${viewport.height}`,
         '--remove-user-data-on-start',

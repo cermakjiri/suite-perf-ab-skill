@@ -175,9 +175,12 @@ and the method. The run folder keeps every session's raw JSON, so any number can
 | Path | What it is |
 | --- | --- |
 | `SKILL.md` | the workflow |
-| `rig/` | the reusable rig: `revs` (pin the target and the branch, up-to-date check), `preflight`, `build`, `fingerprint` (commit, profile, React Compiler coverage of a build), `run` (one session), `plan` (ABBA, resumable, with heartbeats and an ETA), `status` (where a run stands, at once), `aggregate` (statistics and advice), `report`, `open` (MCP exploration), `tenv` (emulator), `attr` (profile attribution), `cleanup`, `locks` (parallel runs); `page/core.js` (in-page probes and helpers); `templates/` |
-| `examples/` | worked scenarios: `history-load` (web, store seed + mocked backend + real thunk), `account-switch` (web + desktop, trusted clicks), `emulator-accounts` (real device and data) |
+| `rig/` | the reusable rig: `revs` (pin the target and the branch, up-to-date check), `preflight`, `build`, `fingerprint` (commit, profile, React Compiler coverage of a build), `bundlediff` (do the sides build the same code), `run` (one session), `plan` (ABBA, resumable, size pilots, power gate, with heartbeats and an ETA), `status` (where a run stands, at once; events for the Monitor tool), `aggregate` (statistics and advice), `report`, `open` (MCP exploration), `tenv` (emulator), `attr` (profile attribution), `cleanup`, `locks` (parallel runs); `page/core.js` (in-page probes and helpers); `templates/` |
+| `rig/fnbench.mjs` | a function-level A/B of two revisions in Node, for code no page reaches or a pure function by size: esbuild bundles per variant, ABBA rounds, A/A and 2x controls (`references/fnbench.md`) |
+| `examples/` | worked scenarios: `history-load` (web + desktop, store seed + mocked backend + the real thunk), `account-switch` (web + desktop, trusted clicks), `desktop-ipc-backend` (desktop, code behind `window.ipcProxy`), `emulator-accounts` and `emulator-history-load` (real device and data) |
+| `examples/fnbench-coinjoin/` | a `fnbench.mjs` config + data module: coinjoin `getAccountInfo` old vs new by size |
 | `references/rig.md` | every script's flags, run.json / plan.json / scenario contract, outputs, metric names |
+| `references/workflow-details.md`, `fnbench.md` | what SKILL.md keeps as one line (the measured why of its rules, the device choice, performance cores, parallel runs, deployed previews); the function-level A/B |
 | `references/builds.md` | the pair and the rebase gate, the build recipe and profiles, the commit proof, React Compiler coverage, parallel runs, build-config changes weighed |
 | `references/desktop.md`, `emulator.md`, `mcp.md`, `discovery.md` | the desktop target, trezor-user-env, exploring with the MCPs, the page-provided tool contract |
 | `references/problem-classes.md`, `house-rules.md` | diff → suspects → scenarios; fixes cited from Suite's own rules |

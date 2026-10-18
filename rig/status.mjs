@@ -8,12 +8,20 @@
  * run without a plan: their records and the newest progress file. A plan-status.json from before
  * pids were recorded reads as finished or unknown, never running.
  *
- *   node status.mjs --run=<name|dir> [--json] [--watch[=<s>]]
+ *   node status.mjs --run=<name|dir> [--json] [--watch[=<s>]] [--events [--every=30]]
  *
  * Reads run.json, out/plan-status.json, out/progress/<session>.json, build-status.json and the
  * machine slot's queue ($PERF_AB_HOME/locks/machine: which run's session or build has the machine,
  * how many wait — other runs included), prints at most 9 lines and exits. --watch re-prints every <s> seconds (default 5) until the plan ends:
- * for your own terminal, never as an agent's foreground wait. Runs inside the sandbox.
+ * for the user's terminal tab (run it there, not with ! in the Claude prompt: a ! check re-enters the
+ * conversation and the agent's reply re-reads the whole context), never as an agent's foreground wait.
+ * Both wait up to a minute for a plan that is about to start.
+ *
+ * --events: for an agent's Monitor tool. Polls every --every seconds (30) and prints one line per
+ * event: a pass starting (with the pass that ended, its outcome, every pass's state and expected
+ * finish for the checklist), a power-wait starting and passing 10 minutes (ask the user), and every
+ * end state — finished, failed, interrupted, stalled (no update for 2 min), plan process gone — after
+ * which it exits. Each line wakes the agent: one model call, ~6-10 a run. Runs inside the sandbox.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -72,7 +80,8 @@ const snapshot = () => {
         s.plan = {
             state, file: ps.plan, pid: ps.pid || null, alive: alive(ps.pid), startedAt: iso(started), updatedAt: ps.updatedAt || null, finishedAt: ps.finished || null,
             elapsedMs: running ? now - started : ps.elapsedMs ?? (ps.finished ? at(ps.finished) - started : null),
-            totals, total: ps.total, toGo: totals.toRun - totals.done - totals.failed, failed: ps.failed || [],
+            totals, total: ps.total, toGo: totals.toRun - totals.done - totals.failed - (totals.notRun || 0), failed: ps.failed || [],
+            passes: ps.passes || [], failedPasses: ps.failedPasses || {}, powerWaitMs: ps.powerWaitMs || 0, log: ps.log || null,
             interrupted: (ps.sessions || []).filter(x => x.state === 'interrupted').map(x => x.id),
             // the performance-core gate: discarded iterations and the wait, finished sessions plus the running one
             discards: (ps.discards || 0) + ((ps.current && ps.current.discards) || 0), gateWaitMs: ps.gateWaitMs || 0,
@@ -89,7 +98,7 @@ const snapshot = () => {
         const ended = (ps.sessions || []).filter(x => x.endedAt).toSorted((a, b) => at(b.endedAt) - at(a.endedAt))[0];
         if (ended) s.last = ended;
         if (running && s.plan.alive === false) s.problems.push(`plan pid ${ps.pid} is gone but its state says running — it crashed or was killed; run plan.mjs again to resume`);
-        else if (running && s.current && s.current.session) session(s.current, `${s.current.id} ${progressText(s.current)}; see out/${s.current.id}.log`);
+        else if (running && s.current && s.current.session) session(s.current, `${s.current.id} ${progressText(s.current)}; see out/${s.current.log ? path.basename(s.current.log) : `${s.current.id}.log`}`);
         else if (running) stale(at(ps.updatedAt), s.current && s.current.id ? `${s.current.id} starting` : 'between sessions');
         // a session run by hand after the plan
         if (!running && newest && at(newest.startedAt) > (at(ps.updatedAt) || 0)) s.latest = newest;
@@ -105,6 +114,8 @@ const snapshot = () => {
         const f = sessionFiles.toSorted((a, b) => mtime(path.join(OUT, b)) - mtime(path.join(OUT, a)))[0];
         if (f) s.last = { id: f.slice(0, -5), endedAt: iso(mtime(path.join(OUT, f))), complete: (tryJson(path.join(OUT, f)) || {}).complete === true };
     }
+    // what --events treats as a stalled or crashed plan: the plan's and its sessions' problems, not a build's
+    s.planProblems = s.problems.slice();
     if (build && (build.state !== 'finished' || now - at(build.updatedAt) < 15 * 60000)) {
         // a build only runs while its pid lives (build.mjs marks Ctrl+C / SIGTERM as interrupted)
         s.build = Object.assign({}, build, { running: build.state === 'running' && alive(build.pid) !== false });
@@ -124,16 +135,19 @@ const lines = s => {
         if (P.state === 'running') {
             out.push(`plan ${s.run} · running · pid ${P.pid ?? '?'} · ${name} · started ${P.startedAt ? clock(P.startedAt) : '?'}`);
             if (c && c.id) out.push(`now  ${c.pass} · ${c.id} (${c.side}) · ${progressText(c)}${c.stageAt && !c.gate ? ` · stage ${dur(Date.now() - at(c.stageAt))}` : ''} · ${dur(c.elapsedMs)} of est ${estText(c.estMs === null || c.estMs === undefined ? null : { ms: c.estMs, rough: c.estRough })}${c.discards ? ` · ${c.discards} discarded` : ''}`);
+            else if (c && c.waiting === 'power') out.push(`now  power-wait before ${c.next} (${c.pass}): ${c.power ? c.power.text : 'not on AC'} since ${clock(c.since)} · ${dur(Date.now() - at(c.since))}${Date.now() - at(c.since) >= 600000 ? ' — over 10 min: plug in, or tell the agent' : ''}`);
             else if (c && c.waiting) out.push(`now  waiting for load ${c.load} ≤ ${c.maxLoad} since ${clock(c.since)}`);
             else out.push('now  between sessions');
-            out.push(`sessions ${P.totals.done} done, ${P.totals.failed} failed, ${P.toGo} to go (of ${P.totals.toRun}; ${P.totals.skipped} complete before)${P.discards ? ` · ${P.discards} iteration${P.discards === 1 ? '' : 's'} discarded` : ''}`);
+            out.push(`sessions ${P.totals.done} done, ${P.totals.failed} failed, ${P.toGo} to go (of ${P.totals.toRun}; ${P.totals.skipped} complete before${P.totals.notRun ? `; ${P.totals.notRun} not run: failed passes` : ''})${P.discards ? ` · ${P.discards} iteration${P.discards === 1 ? '' : 's'} discarded` : ''}`);
             out.push(`time ${dur(P.elapsedMs, true)} elapsed · ${P.etaMs === null ? 'ETA after the first session' : `ETA ${estText({ ms: P.etaMs, rough: P.etaRough }, true)} · finish ≈ ${clock(P.etaAt)}`}`);
         } else if (P.state === 'unknown') {
             out.push(`plan ${s.run} · state unknown (plan-status.json from an older rig, no pid) · started ${P.startedAt ? clock(P.startedAt) : '?'} · ${name}`);
         } else {
             out.push(`plan ${s.run} · ${P.state}${P.finishedAt || P.updatedAt ? ` ${clock(P.finishedAt || P.updatedAt)}` : ''} · took ${dur(P.elapsedMs, true)} · ${name}`);
-            out.push(`sessions ${P.totals.done} done, ${P.totals.failed} failed${P.failed.length ? ` (${P.failed.join(', ')})` : ''}, ${P.totals.skipped} complete before${P.toGo > 0 ? `, ${P.toGo} not run` : ''}${P.interrupted.length ? ` (interrupted in ${P.interrupted.join(', ')}: run the plan again to resume)` : ''}${P.discards || P.gateWaitMs >= 1000 ? ` · ${P.discards} discarded, waited ${dur(P.gateWaitMs)} for performance cores` : ''}`);
+            out.push(`sessions ${P.totals.done} done, ${P.totals.failed} failed${P.failed.length ? ` (${P.failed.join(', ')})` : ''}, ${P.totals.skipped} complete before${P.toGo > 0 || P.totals.notRun ? `, ${P.toGo + (P.totals.notRun || 0)} not run` : ''}${P.interrupted.length ? ` (interrupted in ${P.interrupted.join(', ')}: run the plan again to resume)` : ''}${P.discards || P.gateWaitMs >= 1000 ? ` · ${P.discards} discarded, waited ${dur(P.gateWaitMs)} for performance cores` : ''}`);
         }
+        const fp = Object.entries(P.failedPasses);
+        if (fp.length) out.push(`failed passes: ${fp.map(([n, f]) => `${n} — ${f.reason} (${f.session})`).join(' · ')}`);
     } else if (s.records && s.records.total) {
         out.push(`run ${s.run} · no plan has run here · ${s.records.total} session records, ${s.records.complete} complete`);
     } else {
@@ -166,8 +180,69 @@ const lines = s => {
 };
 
 const print = s => console.log(args.json ? JSON.stringify(s, null, 1) : lines(s).join('\n'));
+const T0 = Date.now();
+// a watcher started together with the plan: the plan may not have written its status yet
+const GRACE_MS = 60000;
+const going = s => (s.plan && s.plan.state === 'running' && s.plan.alive !== false) || (s.build && s.build.running);
+const beforeStart = s => Date.now() - T0 < GRACE_MS && !going(s) && !(s.plan && at(s.plan.updatedAt) >= T0);
 
-if (args.watch === undefined) {
+/** One line per event for the Monitor tool; exits on an end state (see the header). */
+const events = async () => {
+    const every = Math.max(5, Number(args.every ?? 30)) * 1000;
+    let lastPass = null;
+    let powerSince = null;
+    let powerAsked = false;
+    const passList = P => P.passes.map(x => `${x.name} ${x.state === 'done' ? '✓' : x.state === 'failed' ? '✗' : x.state === 'running' ? `▶ ≈${x.finishAt ? clock(x.finishAt) : '?'}` : `≈${x.finishAt ? clock(x.finishAt) : '?'}`}${x.rough ? '~' : ''}`).join(' · ');
+    const say = text => console.log(`${clock(Date.now())} ${text}`);
+    for (;;) {
+        const s = snapshot();
+        const P = s.plan;
+        if (!P || beforeStart(s)) {
+            if (Date.now() - T0 >= GRACE_MS) {
+                say(`no plan running on ${s.run} — nothing to watch`);
+
+                return;
+            }
+            await sleep(5000);
+            continue;
+        }
+        const eta = P.etaAt ? ` · plan ETA ≈ ${clock(P.etaAt)}${P.etaRough ? ' (rough)' : ''}` : '';
+        const done = `${P.totals.done + P.totals.skipped}/${P.total}`;
+        if (P.state !== 'running' || P.alive === false || s.planProblems.length) {
+            const fp = Object.entries(P.failedPasses).map(([n, f]) => `${n} — ${f.reason}`).join('; ');
+            if (P.state === 'running') say(`${P.alive === false ? 'plan process gone' : 'stalled'}: ${s.planProblems.join('; ')} · ${done} done · run plan.mjs again to resume`);
+            else say(`plan ${P.state}${P.state === 'interrupted' ? ' — run plan.mjs again to resume' : ''} · ${P.totals.done} run, ${P.totals.failed} failed${P.totals.notRun ? `, ${P.totals.notRun} not run` : ''}, ${P.totals.skipped} before · took ${dur(P.elapsedMs, true)}${fp ? ` · failed passes: ${fp}` : ''} · the brief is at the end of ${P.log ? path.relative(run.dir, P.log) : 'the plan output'}${P.passes.length ? ` · ${passList(P)}` : ''}`);
+
+            return;
+        }
+        const c = s.current;
+        const pass = c && c.pass;
+        if (pass && pass !== lastPass) {
+            const row = P.passes.find(x => x.name === pass);
+            const prev = lastPass && P.passes.find(x => x.name === lastPass);
+            say(`pass ${pass}${row ? ` (${row.role}) · ${row.sessions} sessions · ≈ ${row.finishAt ? clock(row.finishAt) : '?'}${row.rough ? ' (rough: another workload)' : ''}` : ''} started${prev ? ` · ${prev.name} ${prev.state}${prev.reason ? ` — ${prev.reason}` : ''}` : ''} · ${done} done${eta} · ${passList(P)}`);
+            lastPass = pass;
+        }
+        if (c && c.waiting === 'power') {
+            const since = at(c.since);
+            if (powerSince !== since) {
+                powerSince = since;
+                powerAsked = false;
+                say(`power-wait before ${c.next}: ${c.power ? c.power.text : 'not on AC'} — timing waits for AC power`);
+            } else if (!powerAsked && Date.now() - since >= 600000) {
+                powerAsked = true;
+                say(`power-wait over 10 min before ${c.next} (${c.power ? c.power.text : 'not on AC'}) — ask the user to plug in`);
+            }
+        } else {
+            powerSince = null;
+        }
+        await sleep(every);
+    }
+};
+
+if (args.events !== undefined) {
+    await events();
+} else if (args.watch === undefined) {
     print(snapshot());
 } else {
     const every = (typeof args.watch === 'number' && args.watch > 0 ? args.watch : 5) * 1000;
@@ -175,8 +250,7 @@ if (args.watch === undefined) {
         const s = snapshot();
         if (process.stdout.isTTY && !args.json) process.stdout.write('\x1b[2J\x1b[H');
         print(s);
-        const going = (s.plan && s.plan.state === 'running' && s.plan.alive !== false) || (s.build && s.build.running);
-        if (!going) break;
+        if (!going(s) && !beforeStart(s)) break;
         await sleep(every);
     }
 }

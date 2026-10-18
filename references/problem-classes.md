@@ -56,14 +56,21 @@ scenarios.
 | A swapped dependency | treat as unknown | the full battery |
 | Imports, code splitting, lazy boundaries | load & boot | boot |
 | Data volume assumptions (a list that used to be short) | style & layout, render volume, memory | mount at two sizes, cycle |
+| Code outside the renderer's main thread: a backend behind `createIpcProxy` (`packages/coinjoin`), `suite/desktop-app-main` modules and threads, connect core and blockchain-link on desktop (main), Web Workers (blockchain-link on web, Evolu) | none of the six on the renderer: the wait for another process or thread, the IPC copies (blocking), the result itself | the awaited round trip on desktop, at two sizes (`examples/desktop-ipc-backend`); a function no IPC call reaches: `rig/fnbench.mjs`; web: unaffected when its bundle is code-identical |
 
-Two habits worth keeping:
+Three habits worth keeping:
 
 - **A swapped library is not a refactor.** It changes scheduling, allocation and DOM shape all at
   once. Run everything and let the numbers say which classes moved.
 - **The PR description names what the author noticed.** A change to a shared component affects every
   consumer of it, and the author measured one. Derive suspects from the diff, then compare against
   the description and report any surface it missed.
+- **Find where the code runs before choosing metrics.** The six classes are renderer classes. Code
+  that runs in Electron main, a utility process or a worker moves none of their metrics, so a
+  renderer-only run reports "no change" for a backend call that got 6× faster (coinjoin
+  getAccountInfo: 110 → 18.3 ms at 1x, renderer CPU equal). Time the awaited round trip, compare
+  the result on both sides, and name the targets that never run the code (`references/desktop.md`,
+  "Code outside the renderer").
 
 ## Which metric settles which argument
 
