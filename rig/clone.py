@@ -21,7 +21,9 @@ libc.clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
 os.makedirs(dst, exist_ok=False)
 t0 = time.time()
 for name in sorted(os.listdir(src)):
-    if name in skip:
+    # .env / .env.*: a developer's local settings (and a read the sandbox denies); build.mjs would set
+    # them aside anyway, and a tracked one comes back with the forced checkout
+    if name in skip or name == '.env' or name.startswith('.env.'):
         continue
     s, d = os.path.join(src, name), os.path.join(dst, name)
     if libc.clonefile(s.encode(), d.encode(), 0) != 0:

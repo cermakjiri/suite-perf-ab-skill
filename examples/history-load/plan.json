@@ -1,11 +1,11 @@
 {
  "passes": [
-  { "name": "counts", "role": "counts", "order": "AB", "args": { "k": 1, "rates": "1", "warmup": 0, "cfg": { "countIdb": true, "fiberStats": true } } },
-  { "name": "pilot", "role": "trial", "order": "AB", "args": { "k": 1, "rates": "4", "warmup": 0, "cfg": { "pages": 10 } } },
-  { "name": "h20", "role": "timing", "order": "ABBAABBA", "args": { "k": 8, "rates": "4,1", "warmup": 2, "cfg": { "pages": 20 } } },
-  { "name": "ctl", "role": "control", "order": "ABBA", "args": { "k": 8, "rates": "4", "warmup": 2, "altInject": 10, "cfg": { "pages": 20 } } },
-  { "name": "h40", "role": "timing", "order": "ABBA", "args": { "k": 6, "rates": "4,1", "warmup": 2, "cfg": { "pages": 40 } } },
-  { "name": "norem", "role": "timing", "order": "AB", "args": { "k": 6, "rates": "4", "warmup": 2, "cfg": { "pages": 20, "remember": false } } },
-  { "name": "more", "role": "timing", "extends": "h20", "order": "ABBA", "optional": true }
+  { "name": "counts", "role": "counts", "order": "AB", "args": { "k": 1, "rates": "1", "warmup": 0, "cfg": { "remember": true, "countIdb": true, "fiberStats": true } }, "purpose": "React commits, fibers and IndexedDB operations per store of one load (persisted, so the writes are counted too). Instrumented: no timing claims." },
+  { "name": "pilot", "role": "trial", "order": "AB", "args": { "k": 1, "rates": "4", "warmup": 0, "cfg": { "pages": 10 } }, "purpose": "A short trial and a first look; plan.mjs adds a size pilot per timing workload before timing." },
+  { "name": "h20", "role": "timing", "order": "ABBAABBA", "args": { "k": 8, "rates": "4,1", "warmup": 2, "cfg": { "pages": 20 } }, "purpose": "The main verdict: a 500-tx history load, nothing persisted (remember false)." },
+  { "name": "ctl", "role": "control", "order": "ABBA", "args": { "k": 10, "rates": "4", "warmup": 2, "altInject": 10, "cfg": { "pages": 20 } }, "purpose": "Paired control: 0 / 10 ms per page in ABBA order (k 10, warm-up 2: 4 pairs in whole 0 I I 0 blocks) must land in load CPU." },
+  { "name": "h40", "role": "timing", "order": "ABBA", "args": { "k": 6, "rates": "4,1", "warmup": 2, "cfg": { "pages": 40 } }, "purpose": "Second size: flat vs linear." },
+  { "name": "persisted", "role": "timing", "order": "AB", "args": { "k": 6, "rates": "4", "warmup": 2, "cfg": { "pages": 20, "remember": true } }, "purpose": "Negative control for persistence: a diff that does not touch storage drains the same on both sides (drain.persistMs, drain.taskCorrMs). When the diff touches storage, set remember true in every pass instead." },
+  { "name": "more", "role": "timing", "extends": "h20", "order": "ABBA", "optional": true, "purpose": "One more ABBA block of h20 when the advice says it could change a verdict." }
  ]
 }

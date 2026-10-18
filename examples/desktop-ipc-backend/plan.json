@@ -1,0 +1,10 @@
+{
+ "passes": [
+  { "name": "pilot", "role": "trial", "order": "AB", "args": { "k": 2, "rates": "4", "warmup": 1 }, "purpose": "Both sides spawn the backend and call it over IPC: per-iteration time for the ETA, and the result hashes at it.n 0 and 1 must match across sides (hashes.mjs). No counts pass: the renderer runs no React work here, and the hash is the scenario's own count." },
+  { "name": "main", "role": "timing", "order": "ABBAABBA", "args": { "k": 8, "rates": "4,1", "warmup": 2 }, "purpose": "The timing verdict at size S (30 txs × 100 inputs/outputs, 160 addresses): 4 v 4 sessions at 4x and 1x. The utility process is not throttled, so the two rates differ only in the renderer's IPC share." },
+  { "name": "ctl", "role": "control", "order": "ABBA", "args": { "k": 8, "rates": "4", "warmup": 2, "altInject": 10 }, "purpose": "Paired control: 0 / 10 ms injected per 10 txs (30 ms per call) on the renderer must land in the round trip (k 8, warm-up 2: 3 pairs a session)." },
+  { "name": "big", "role": "timing", "order": "ABBAABBA", "args": { "k": 4, "rates": "4", "warmup": 1, "cfg": { "size": "M" } }, "purpose": "Second size, M (60 txs × 200 inputs/outputs, 300 addresses): flat, linear or superlinear growth of the round trip. ABBAABBA up front: 2 v 2 can never be called." },
+  { "name": "warm", "role": "timing", "order": "ABBAABBA", "optional": true, "args": { "k": 8, "rates": "4", "warmup": 2, "cfg": { "warm": 1 } }, "purpose": "The call on a warm backend, as the app makes most of them (it keeps the backend alive): before() spawns it and calls it once on other data, so the timed call is the second into the process. spawn.ms reads ~0 here (not timed). Runs with --only=warm." },
+  { "name": "more", "role": "timing", "extends": "main", "order": "ABBA", "optional": true, "purpose": "One more ABBA block of main (sessions main-5-A …). Runs only with --only=more, when aggregate's advice says more sessions could change a verdict." }
+ ]
+}

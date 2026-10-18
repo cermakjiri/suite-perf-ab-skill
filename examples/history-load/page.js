@@ -2,23 +2,35 @@
  * history-load — in-page part. Worked example of a scenario, ported from the PR #33320 A/B
  * (storageMiddleware coalescing per-page IndexedDB rewrites).
  *
- * One iteration = one full transaction-history load of a remembered wallet's BTC account: the REAL
- * fetchAllTransactionsForAccountThunk (found in the bundle by its type prefix) pages through
+ * One iteration = one full transaction-history load of a wallet's BTC account: the REAL
+ * fetchAllTransactionsForAccountThunk (through the page's suite.thunk tool, else the bundle's export:
+ * web and desktop; postInit returns which path ran) pages through
  * TrezorConnect.getAccountInfo, replaced by a deterministic backend: `pages` pages of 25 synthetic
  * transactions, each answered after `latency` ms. Historic fiat rates for every page answer after
- * `rateLatency` ms, so both persisted paths (txs rows, the historicRates row) run.
+ * `rateLatency` ms, so both persisted paths (txs rows, the historicRates row) run when the device is
+ * remembered.
  *
  *   load   dispatch -> the thunk settles (all pages in Redux): what the user waits for
- *   drain  -> every row of the account is in IndexedDB, plus 300 ms of quiet
+ *   drain  -> every row of the account is in IndexedDB (none when not remembered), plus 300 ms of quiet
  *
+ * cfg.remember defaults to false: with it on, the IndexedDB drain is most of each iteration (PR
+ * 33507's 1,000-tx pass: ~11 s of ~17 s at 4x, the same on both sides) and a 5,000-tx drain outlasts the
+ * phase timeout. Turn it on when the diff touches storage or persistence, and keep one persisted pass
+ * as a negative control otherwise (scenario.mjs).
  * Every iteration loads a different, never-loaded account: after a completed fetchAll Suite marks
  * the account areAllTransactionsLoaded and a reload would page by 5 — a different workload.
  * Synthetic state, byte-identical on both sides; real IndexedDB, real persistence.
  */
 (() => {
     const H = window.__H;
-    const CFG = Object.assign({ remember: true, countIdb: false, pages: 20, latency: 100, rateLatency: 40, timeoutMs: 240000 }, H.CFG);
+    const CFG = Object.assign({ remember: false, countIdb: false, pages: 20, latency: 100, rateLatency: 40 }, H.CFG);
     const RUN = H.RUN;
+    // the drain gives up just before the runner's phase timeout would (H.RUN.phaseTimeoutMs, 600 s by
+    // default) and returns { timedOut }: run.mjs treats it as a phase timeout (the session stops, plan.mjs
+    // marks the pass failed: "drain > 10:00") instead of an iteration that silently waited for minutes.
+    // cfg.timeoutMs can only shorten it
+    const PHASE_MS = RUN.phaseTimeoutMs || 600000;
+    const DRAIN_BUDGET_MS = Math.min(Number(CFG.timeoutMs) || Infinity, PHASE_MS - Math.min(5000, PHASE_MS * 0.1));
     // one per iteration, plus spares for iterations the runner discards and retries with fresh data
     const TARGETS = (RUN.iterations || 16) + (RUN.spares || 0) + 1;
     const DS = '1stTestnetAddress@device_id:0';
@@ -100,9 +112,11 @@
         return out;
     };
     // Every account has hours of its own (one transaction per hour, one block of hours per account).
-    // Suite keeps historic fiat rates in one map keyed by the rounded hour: with timestamps shared
-    // between accounts, every load after the first finds its rates fetched by an earlier load, and the
-    // map never grows. 12 h apart, 25 targets x 1,000 transactions would reach back before 2009.
+    // Suite keeps historic fiat rates in one map per coin and currency, keyed by the rounded hour: with
+    // timestamps shared between accounts, a load could find its rates fetched by an earlier one. Own
+    // hours make the map grow by 1,000 entries per load instead, so after() puts the seed back (see
+    // there) and every load starts from an empty map. 12 h apart, 25 targets x 1,000 transactions
+    // would reach back before 2009.
     const HOUR = 3600;
     const T0 = 1759000000 - (1759000000 % HOUR);
     const blockTimeOf = (acc, i) => T0 - (acc * CFG.pages * TX_PER_PAGE + i) * HOUR;
@@ -182,6 +196,14 @@
         suiteSyncOwners: [], suiteSyncQuotaManager: undefined, featureFeedback: undefined,
         discreetMode: { isActive: false }, debug: undefined, earnOnboarding: [],
     });
+
+    // Suite's storage load with the seed: seed() delivers it, after() delivers it again
+    const loadSeed = () => {
+        dispatch({ type: '@storage/load', payload: basePayload(makeAccounts()) });
+        dispatch({ type: '@suite/device/updateSelectedDevice', payload: device });
+    };
+    // historic fiat rates in Redux, all maps together
+    const historicPoints = () => Object.values(st().wallet.fiat.historic || {}).reduce((s, m) => s + (m && typeof m === 'object' ? Object.keys(m).length : 0), 0);
 
     // ------------------------------------------------------------ IndexedDB operation counts
     // counting pass only (cfg.countIdb): patched prototypes tax every IDB call — never in a timing pass
@@ -332,9 +354,7 @@
         ready: () => !!H.store() && !!H.connect(),
 
         async seed() {
-            const accounts = makeAccounts();
-            dispatch({ type: '@storage/load', payload: basePayload(accounts) });
-            dispatch({ type: '@suite/device/updateSelectedDevice', payload: device });
+            loadSeed();
             await settle(200);
 
             return { accounts: st().wallet.accounts.length, targets: TARGETS, remember: device.remember };
@@ -344,14 +364,19 @@
             fakeTransport();
             const mocks = installConnectMocks();
             const fiat = seedRates();
-            fetchAll = H.findThunk('@common/wallet-core/transactions/fetchAllTransactionsForAccount');
+            // the page's suite.thunk tool (desktop bundles keep the thunk module-internal), else the
+            // bundle's export (web); discover first: Suite answers devtoolstooldiscovery asynchronously
+            await H.discover();
+            fetchAll = H.thunk('@common/wallet-core/transactions/fetchAllTransactionsForAccount');
             await settle(400);
             await openProbe();
-            // web bundles export it; desktop bundles keep it module-internal (use a UI-driven scenario there)
-            if (!fetchAll) throw new Error('fetchAllTransactionsForAccountThunk not found in the bundle — history-load runs on web only');
+            if (!fetchAll) throw new Error('fetchAllTransactionsForAccountThunk: neither the page\'s suite.thunk tool nor a bundle export');
 
-            return { mocks, fiat, thunk: !!fetchAll };
+            return { mocks, fiat, thunk: fetchAll.via };
         },
+
+        // valid() drops an iteration that did not start from the seed's empty rate map
+        before: () => ({ historic: historicPoints() }),
 
         phases: {
             async load({ n }) {
@@ -362,7 +387,8 @@
                 if (CFG.countIdb) { resetCounts(); IDBC.on = true; }
                 let loadError = null;
                 try {
-                    const res = await dispatch(fetchAll({ accountKey: acc.key }));
+                    // H.thunk dispatches and resolves with the thunk's action
+                    const res = await fetchAll({ accountKey: acc.key });
                     if (res && res.error) loadError = String(res.error.message || res.error);
                 } catch (e) {
                     loadError = String(e);
@@ -377,10 +403,19 @@
                 const expected = CFG.remember ? CFG.pages * TX_PER_PAGE : 0;
                 let rows = -1;
                 let polls = 0;
+                const t0 = performance.now();
                 for (;;) {
-                    rows = await idbCount(acc);
+                    const left = DRAIN_BUDGET_MS - (performance.now() - t0);
+                    // a count waits behind IndexedDB's pending writes: never past what is left of the budget
+                    const n = left > 0 ? await Promise.race([idbCount(acc), sleep(left).then(() => null)]) : null;
+                    if (n === null) {
+                        const s = Math.round((performance.now() - t0) / 1000);
+
+                        return { expected, rows, polls, persisted: false, persistMs: +(performance.now() - tLoaded).toFixed(1), timedOut: `${rows < 0 ? 'no row count answered' : `${rows} of ${expected} rows in IndexedDB`} after ${s} s` };
+                    }
+                    rows = n;
                     polls += 1;
-                    if (rows === expected || performance.now() - tLoaded > CFG.timeoutMs) break;
+                    if (rows === expected) break;
                     await sleep(25);
                 }
                 const persistMs = +(performance.now() - tLoaded).toFixed(1);
@@ -391,7 +426,8 @@
             },
         },
 
-        // verify what is persisted, reset the account (Redux + IDB), check nothing writes its rows back
+        // verify what is persisted, reset the account (Redux + IDB), check nothing writes its rows back,
+        // then put the seed back
         async after({ n }) {
             const acc = targetAccount(n);
             if (!acc) return null;
@@ -405,6 +441,14 @@
             }
             await sleep(1300);
             const rowsAfterQuiet = await idbCount(acc);
+            // Every persisted slice back to the seed, so the next load starts where this one did. The
+            // historic fiat rates are the reason: resetTransaction leaves them, nothing else shrinks
+            // them, every load adds its 1,000 hours, and the reducer re-spreads the whole map through
+            // immer for every page's rates (fiatRatesReducer, updateTxsFiatRatesThunk.fulfilled). Kept,
+            // they make each load ~3 % costlier than the one before: JS in promise continuations,
+            // so it shows in otherMs, not scriptMs.
+            loadSeed();
+            await settle(300);
             let heapAfterGcMiB = null;
             if (typeof globalThis.gc === 'function' && performance.memory) {
                 globalThis.gc();

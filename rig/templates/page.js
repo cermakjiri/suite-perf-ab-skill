@@ -4,7 +4,9 @@
  * window.__H (core): CFG, RUN, store(), state(), dispatch(), connect() (TrezorConnect as the app
  * calls it), findThunk(typePrefix) (any RTK thunk from the production bundle), findModules(needle),
  * goto(routeName, params), suiteReady(), waitFor(fn, opts), settle(ms), sleep(ms), nextFrame(),
- * injectCost() (call once per unit of work: the rig control), probes.stats(from, to).
+ * injectCost() (call once per unit of work: the rig control), probes.stats(from, to); when Suite
+ * answers devtoolstooldiscovery (references/discovery.md): tool(name, args), hasTool(name),
+ * thunk(typePrefix) (arg => Promise<resolved action>; falls back to the bundle's export).
  *
  * Contract (all optional except phases):
  *   ready()            app booted far enough to seed (default: the store exists)

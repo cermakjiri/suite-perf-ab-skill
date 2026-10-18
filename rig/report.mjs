@@ -2,7 +2,12 @@
  * Build a self-contained HTML report (inline CSS and SVG, Google Fonts only) from a run's
  * summary.json, its session files and an optional narrative.json written by the agent.
  *
- *   node report.mjs --run=<name|dir> [--narrative=<file>] [--out=<file.html>] [--main=<pass>]
+ *   node report.mjs --run=<name|dir> [--narrative=<file>] [--out=<file.html>] [--main=<pass>] [--text]
+ *
+ * --text also writes report.txt next to it: every visible text of the page (verdict cards, findings,
+ * sections, every table as rows, controls, rig health, caveats, method; the session medians of the
+ * strip charts from their tooltips) and then every href/src URL and any <script> in the HTML — no CSS
+ * or SVG markup. Review that file before publishing instead of reading the HTML (~4x smaller).
  *
  * narrative.json (all optional): { "title", "pageTitle", "summary", "verdicts": [{ "label", "big",
  * "from", "why", "tone": "better|worse|tradeoff|flat" }], "findings": [html], "caveats": [html],
@@ -15,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { RIG, parseArgs, loadRun, resolveIn, readJson, exists, median, importScenario, CALL_P, called, controlVerdict, controlText, passRole, verdictMetrics, countKeys, PROFILES } from './lib.mjs';
 import { compilerText } from './fingerprint.mjs';
+import { bundlesText } from './bundlediff.mjs';
 
 const args = parseArgs();
 const run = loadRun(args.run);
@@ -166,6 +172,10 @@ const buildText = k => {
 
     return `${proof}${rel}${prof}${s.url ? ` · ${s.url}` : ''}`;
 };
+// the power source the sessions ran on (run.mjs meta.power; aggregate refuses a timing pass on two)
+const powerText = k => Object.entries(Object.groupBy(sessionsOf(k).filter(x => x.power), x => x.power)).map(([p, l]) => `${{ ac: 'AC', battery: 'battery' }[p] || p} in ${l.length} sessions`).join(' · ') || '– (not recorded: sessions from before the power gate)';
+// page-provided tools (devtoolstooldiscovery, references/discovery.md), as the first session saw them
+const toolsText = t => (t && t.found ? t.groups.map(g => `${g.name}${g.description ? ` — ${g.description}` : ''}: ${g.tools.join(', ')}`).join('; ') : 'none (no devtoolstooldiscovery answer)');
 const sideCard = (k, i) => {
     const s = S.run.sides[k];
     const f = firstSession(k) || {};
@@ -186,11 +196,13 @@ const sideCard = (k, i) => {
 <dt>sessions</dt><dd>${sessionsOf(k).length} (${sessionsOf(k).filter(x => x.complete).length} complete)</dd>
 ${markers ? `<dt>code markers</dt><dd>${markers}</dd>` : ''}
 <dt>coverage files</dt><dd>${env.coverageFiles ?? '–'}</dd>
-<dt>React renderers</dt><dd>${env.renderers ?? '–'}${env.desktopLaunches > 1 ? ` (desktop: ${env.desktopLaunches} launches)` : ''}</dd>
+<dt>React renderers</dt><dd>${env.renderers ?? '–'}${env.desktopLaunches > 1 ? ` (desktop: ${env.desktopLaunches} launches)` : ''}${env.pageHook && env.pageHook.installed && !env.hook ? " (commits from the page's early hook)" : ''}</dd>
+<dt>page tools</dt><dd>${esc(toolsText(env.discovery))}</dd>
 <dt>calibration loop</dt><dd>${esc(cal)}${ratio ? ` → ${ratio}x` : ''}</dd>
 <dt>idle CPU</dt><dd>${esc(idle)}</dd>
 <dt>debugger canary</dt><dd>${canary ? `spread/slice ${canary} (≈1 = no debugger)` : '–'}</dd>
 <dt>performance cores</dt><dd>${esc(pcoreText(k))}</dd>
+<dt>power</dt><dd>${esc(powerText(k))}</dd>
 <dt>browser</dt><dd>${esc(f.browser || '–')}</dd></dl></div>`;
 };
 
@@ -205,14 +217,25 @@ const passSections = passNames.map(p => {
         const keys = counts ? countKeys(R, headline) : headKeys.concat(R.metrics[PLACEMENT] && !headKeys.includes(PLACEMENT) ? [PLACEMENT] : []);
         const extra = counts ? [] : Object.keys(R.metrics).filter(k => !keys.includes(k) && !k.startsWith('pcore.') && called(R.metrics[k].delta) && Math.abs(R.metrics[k].delta.medPct || 0) >= 5);
         const problems = sideKeys.flatMap(k => (R.sides[k] ? R.sides[k].problems : []));
-        const ctl = R.control ? `<figure class="tbl"><figcaption>Injected-cost control <span class="sub">a known busy block per unit of work, alternating 0 / ${esc(meta.altInject)} ms inside each session; the metric should move by the injected total</span></figcaption><div class="scroll"><table class="plain"><thead><tr><th>Session</th><th class="num">Expected</th><th class="num">total.taskMs moved</th><th class="num">Landed</th></tr></thead><tbody>${Object.values(R.control).flat().map(c => {
+        const ctl = R.control ? `<figure class="tbl"><figcaption>Injected-cost control <span class="sub">a known busy block per unit of work, 0 / ${esc(meta.altInject)} ms inside each session (order: 0 plain, I injected); the metric should move by the injected total. Landed: each injected iteration against its plain neighbours (the line between the nearest plain one before and after it; the one neighbour at an end), on the phases the cost went into, the session's median — slow variation such as a climb inside the session cancels pair by pair; this is what the verdict reads. Trend fit: the injected iterations against the line through all plain ones (a cross-check). Naive: median injected − median plain on total.taskMs</span></figcaption><div class="scroll"><table class="plain"><thead><tr><th>Session</th><th>Order</th><th class="num">Expected</th><th class="num">Landed</th><th class="num">Trend fit</th><th class="num">Naive</th><th class="num">Plain trend</th></tr></thead><tbody>${Object.values(R.control).flat().map(c => {
             const t = c.landed['total.taskMs'] || Object.values(c.landed)[0] || {};
+            const tr = c.trend;
+            const nb = c.neighbour;
 
-            return `<tr><td class="mono">${esc(c.session)}</td><td class="num">${esc(fmtMs(c.expectedMs))}</td><td class="num">${esc(fmtMs(t.deltaMs))}</td><td class="num">${esc(t.landedPct ?? '–')}%</td></tr>`;
+            return `<tr><td class="mono">${esc(c.session)}</td><td class="mono">${esc(c.seq || '–')}</td><td class="num">${esc(fmtMs(tr ? tr.expectedMs : c.expectedMs))}</td><td class="num">${nb ? `${esc(nb.landedPct)}%<span class="spread">${esc(nb.metric)} · ${esc(nb.pairs)} pairs: ${esc(nb.pcts.join(' '))}</span>` : '–'}</td><td class="num">${tr ? `${esc(tr.landedPct ?? '–')}%<span class="spread">${esc(fmtMs(tr.deltaMs))}</span>` : '–'}</td><td class="num">${esc(t.landedPct ?? '–')}%<span class="spread">total.taskMs ${esc(fmtMs(t.deltaMs))}</span></td><td class="num">${tr ? esc(`${tr.slopeMsPerIter > 0 ? '+' : ''}${fmtMs(tr.slopeMsPerIter)} / it`) : '–'}</td></tr>`;
         }).join('')}</tbody></table></div>${controlVerdict(R.control) ? `<p class="note">${esc(controlText(controlVerdict(R.control)))}</p>` : ''}</figure>` : '';
+        // in-session drift of the headline CPU metric (aggregate: R.drift, sessions[].drift)
+        const d = R.drift;
+        const signed = v => `${v > 0 ? '+' : ''}${v}`;
+        const driftText = d ? `In-session drift of <code>${esc(d.key)}</code> (slope over each session's kept iterations, % of its median per iteration): ${sideKeys.filter(k => R.sides[k]).map(k => `${esc(k)} ${R.sides[k].sessions.map(x => (x.drift ? esc(signed(+x.drift.pctPerIter.toFixed(1))) : '–')).join(' ')}`).join(' · ')} — median ${esc(signed(d.medianPctPerIter))} %/it (${esc(`${d.medianMsPerIter > 0 ? '+' : ''}${fmtMs(d.medianMsPerIter)}`)} / it)` : '';
+        const vs = d && d.ref ? `${fmtMs(d.climbMs)} over a session (|slope| × k/2) against the ${esc(d.ref.key)}${d.ref.key === 'injected cost' ? '' : ' Δ'} of ${fmtMs(d.ref.ms)}` : '';
+        const drift = !d ? '' : d.flagged
+            ? `<div class="callout"><p><b>The load builds up inside the sessions.</b> ${driftText}: past ${esc(d.thresholdPct)} %/it with most sessions agreeing, and ${vs} — enough to matter. The session medians hold for this k${roleOf(p) === 'control' ? '; the control verdict pairs each injected iteration with its neighbours' : ''}.</p></div>`
+            : `<p class="note">${driftText}${d.consistent ? ` — information only: ${vs}, under a third of it` : ''}.</p>`;
 
         return `${table(`${esc(passLabel(p))} @ ${esc(rate)}x CPU<span class="sub">k ${esc(meta.k)} per session, first ${esc(meta.warmup)} discarded · ${sideKeys.map(k => `${k} ${R.sides[k] ? R.sides[k].sessions.length : 0} sessions`).join(', ')}${meta.altInject ? ' · inject=0 iterations only' : ''}${counts ? ' · counts only: the instrumentation taxes timing' : ''}</span>`, R, keys, null)}
 ${extra.length ? table(`Other metrics whose sessions separate (p ≤ ${CALL_P}) by 5% or more · ${esc(rate)}x`, R, extra, null) : ''}
+${drift}
 ${ctl}
 ${problems.length ? `<div class="callout"><p><b>${problems.length} iterations dropped</b>: ${problems.slice(0, 6).map(esc).join('; ')}${problems.length > 6 ? ' …' : ''}</p></div>` : ''}`;
     }).join('\n');
@@ -235,15 +258,38 @@ const compilerDiffers = (() => {
 
     return t.every(x => typeof x === 'number') && new Set(t).size > 1;
 })();
+// page-provided tools (devtoolstooldiscovery, references/discovery.md): the sides must offer the same contract
+const sideTools = sideKeys.map(k => toolsText(S.run.sides[k].tools));
+const toolsCaveat = sideTools.length > 1 && new Set(sideTools).size > 1 ? `The sides offer different page tools (${sideKeys.map((k, i) => `${esc(k)}: ${esc(sideTools[i])}`).join('; ')}): the change touches Suite's automation tools; where a tool was missing the rig used its own helpers.` : null;
 const autoCaveats = [
     baseCaveat,
     profileCaveat,
+    toolsCaveat,
     S.run.device === 'synthetic' ? 'Synthetic state: seeded store and mocked backend, identical on both sides; no device and no network.' : `Device: ${esc(S.run.device)} (trezor-user-env emulator) — real connect flow; backend latency adds noise to wall times, CPU totals are less affected.`,
     'Percentiles pool iterations from several page sessions; iterations inside a session are correlated, so the session columns decide whether a timing difference is real.',
     `One machine${loads.length ? `, 1-min load average ${Math.min(...loads)}–${Math.max(...loads)} at session starts` : ''}; numbers do not transfer to other hardware, only the direction and the session separation do.`,
     `Compared against ${esc(sideLabel(KA))} at <code>${esc(short(S.run.sides[KA].sha || S.run.sides[KA].rev))}</code>.`,
 ];
 
+// passes plan.mjs marked failed (a phase timeout, a runaway first iteration): never silently missing
+const planStatus = (() => {
+    try {
+        return readJson(path.join(run.dir, 'out', 'plan-status.json'));
+    } catch {
+        return null;
+    }
+})();
+// out/failed-passes.json keeps them across plans (plan.mjs); the last plan's status as the fallback
+const failedPasses = Object.entries((() => {
+    try {
+        return readJson(path.join(run.dir, 'out', 'failed-passes.json'));
+    } catch {
+        return (planStatus && planStatus.failedPasses) || {};
+    }
+})());
+const failedCallout = failedPasses.length ? `<div class="callout"><p><b>Passes that failed and were not run to the end.</b> ${failedPasses.map(([n, f]) => esc(`${passLabel(n)}: ${f.reason} (${f.session}${f.via ? `, the trial ${f.via}` : ''})`)).join(' · ')}</p></div>` : '';
+// build.mjs's bundle comparison (run.json bundles): a code-identical target is unaffected by the change
+const bundleNote = run.bundles && Object.keys(run.bundles).length ? `<p class="note">Bundle comparison (each side's JS with mangled names, chunk hashes, the commit and the signed config masked): ${Object.entries(run.bundles).flatMap(([t, pairs]) => Object.entries(pairs).map(([pair, r]) => esc(bundlesText(t, pair, r)))).join(' · ')}.</p>` : '';
 const prNum = S.run.pr ? (String(S.run.pr).match(/(\d+)\/?$/) || [])[1] : null;
 const pageTitle = N.pageTitle || (prNum ? `PR ${prNum} perf A/B` : `${S.run.id || 'Suite'} perf A/B`);
 const title = N.title || S.run.title || pageTitle;
@@ -265,11 +311,12 @@ ${verdicts.length ? `<section><h2>Verdict</h2>${verdictCards(verdicts)}</section
 ${N.findings && N.findings.length ? `<section><h2>Findings</h2><ul>${N.findings.map(f => `<li>${f}</li>`).join('')}</ul></section>` : ''}
 ${(N.sections || []).map(s => `<section><h2>${esc(s.title)}</h2>${s.html}</section>`).join('\n')}
 ${passSections}
-<section><h2>Builds and rig health</h2>${placementFlags.length ? `<div class="callout"><p><b>Efficiency-core placement differs between the sides.</b> ${placementFlags.map(f => esc(`${passLabel(f.pass)} @ ${f.rate}x: ${f.text}.`)).join(' ')}</p></div>` : ''}<div class="sidecards">${sideKeys.map(sideCard).join('')}</div>
+<section><h2>Builds and rig health</h2>${failedCallout}${placementFlags.length ? `<div class="callout"><p><b>Efficiency-core placement differs between the sides.</b> ${placementFlags.map(f => esc(`${passLabel(f.pass)} @ ${f.rate}x: ${f.text}.`)).join(' ')}</p></div>` : ''}${S.warnings && S.warnings.length ? `<div class="callout"><p><b>Aggregate warnings.</b> ${S.warnings.map(w => esc(w)).join(' · ')}</p></div>` : ''}<div class="sidecards">${sideKeys.map(sideCard).join('')}</div>
+${bundleNote}
 ${compilerDiffers ? `<div class="callout"><p><b>The sides differ in React Compiler coverage.</b> ${sideKeys.map(k => esc(`${k}: ${compilerText(S.run.sides[k].fingerprint.compiler, 4)}`)).join(' · ')}. Manual memoization reads differently on each side: redundant where compiled, the only mechanism where not.</p></div>` : ''}
 <p class="note">Every Suite bundle inlines the commit it was built from (COMMITHASH and the release string): the build's fingerprint checks it against the clone, and every session found its own side's commit and no other side's in the loaded modules — no hand-picked marker needed. React Compiler coverage counts the compiler's memo blocks (<code>react.memo_cache_sentinel</code>), mapped to source files through the source maps. The calibration loop is a fixed busy loop per CPU rate (the higher rate should read about that many times slower). The spread/slice canary reads about 1 without a debugger and about 25 when a DevTools debugger taxes spreads.</p>
 ${S.advice && S.advice.next && S.advice.next.length ? `<p class="note">Could more sessions change a verdict? ${(S.advice.controls || []).filter(c => c.state && c.state !== 'failed').map(c => esc(controlText(c, `${c.pass} @ ${c.rate}x`))).concat(S.advice.next.map(esc)).join(' · ')}</p>` : ''}</section>
-<section><h2>Caveats</h2><ul>${autoCaveats.concat(N.caveats || []).map(c => `<li>${c}</li>`).join('')}</ul></section>
+<section><h2>Caveats</h2><ul>${autoCaveats.concat(N.caveats || []).filter(Boolean).map(c => `<li>${c}</li>`).join('')}</ul></section>
 <section><h2>Method</h2><ul>
 <li>Each session is one fresh ${S.run.target === 'desktop' ? 'Electron app launch (own user-data dir, wiped at start)' : 'headless Chromium page'} serving a local production build; sessions alternate ${esc(sideKeys.join('/'))} in ABBA order.</li>
 <li>Per CPU rate: a calibration loop, a ${esc(((S.passes[mainPass] && S.passes[mainPass].meta && S.passes[mainPass].meta.idleMs) || 10000) / 1000)}-second idle window (background CPU per second), then k iterations of a two-spin warm-up and the measured phases <code>${esc((scenario.phases || []).map(p => (typeof p === 'string' ? p : p.name)).join(' → '))}</code>.</li>
@@ -280,3 +327,52 @@ ${S.advice && S.advice.next && S.advice.next.length ? `<p class="note">Could mor
 `;
 fs.writeFileSync(OUT, html);
 console.log('written', OUT, `${Math.round(fs.statSync(OUT).size / 1024)} KB`);
+
+// ------------------------------------------------------------------ report.txt
+const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', ndash: '–', mdash: '—', middot: '·', times: '×', hellip: '…', le: '≤', ge: '≥', minus: '−', rarr: '→', larr: '←', plusmn: '±' };
+const decode = s => s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, e) => (e[0] === '#' ? String.fromCodePoint(e[1].toLowerCase() === 'x' ? parseInt(e.slice(2), 16) : Number(e.slice(1))) : ENTITIES[e.toLowerCase()] ?? m));
+/**
+ * The page as plain text for a review before publishing: what a reader sees, in reading order, tables
+ * as `| cell | cell |` rows, a strip chart as its session medians (the dots' tooltips), then every
+ * URL the page links or loads and every script it carries.
+ */
+const htmlText = page => {
+    const urls = [...new Set([...page.matchAll(/\s(?:href|src)\s*=\s*(?:"([^"]*)"|'([^']*)')/gi)].map(m => decode(m[1] ?? m[2])))];
+    const scripts = [...page.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].map(m => `${m[1].trim() || '(inline)'} ${m[2].trim().length} chars${m[2].trim() ? `: ${m[2].trim().slice(0, 120)}` : ''}`);
+    const pageTitle_ = (page.match(/<title>([\s\S]*?)<\/title>/i) || [])[1];
+    const chart = svg => {
+        const dots = cls => [...svg.matchAll(new RegExp(`class="${cls}"[^>]*><title>([\\s\\S]*?)</title>`, 'g'))].map(m => m[1]);
+        const [a, b] = [dots('dot-a'), dots('dot-b')];
+        if (a.length || b.length) return ` sessions ${KA}: ${a.join(' ') || '–'} | ${KB}: ${b.join(' ') || '–'} `;
+        const titles = [...svg.matchAll(/<title>([\s\S]*?)<\/title>/g)].map(m => m[1]);
+        const label = (svg.match(/aria-label="([^"]*)"/) || [])[1];
+
+        return label || titles.length ? ` [chart${label ? `: ${label}` : ''}${titles.length ? ` — ${titles.join(', ')}` : ''}] ` : ' ';
+    };
+    let t = page
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/<head\b[\s\S]*?<\/head>/gi, '')
+        .replace(/<(style|script|noscript|template)\b[\s\S]*?<\/\1>/gi, ' ')
+        .replace(/<svg\b[\s\S]*?<\/svg>/gi, chart)
+        .replace(/<h([1-6])\b[^>]*>/gi, (m, n) => `\n\n${'#'.repeat(Number(n))} `)
+        .replace(/<\/h[1-6]>/gi, '\n')
+        .replace(/<li\b[^>]*>/gi, '\n- ')
+        .replace(/<tr\b[^>]*>/gi, '\n|')
+        .replace(/<\/t[hd]>/gi, ' |')
+        .replace(/<dt\b[^>]*>/gi, '\n')
+        .replace(/<\/dt>/gi, ': ')
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/(p|div|section|header|footer|figure|figcaption|table|thead|tbody|ul|ol|dl|article|main)>/gi, '\n')
+        // spans carry the report's sub-labels (hint, spread, verdict-tag): a word boundary on both sides
+        .replace(/<\/?span\b[^>]*>/gi, ' ')
+        .replace(/<\/dd>/gi, ' ')
+        .replace(/<[^>]+>/g, '');
+    t = decode(t).split('\n').map(l => l.replace(/[ \t]+/g, ' ').trim()).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+
+    return `${pageTitle_ ? `title: ${decode(pageTitle_)}\n\n` : ''}${t}\n\n## URLs in the page (href/src)\n${urls.map(u => `- ${u}`).join('\n') || '- none'}\n\n## Scripts in the page\n${scripts.map(s => `- ${s}`).join('\n') || '- none'}\n`;
+};
+if (args.text) {
+    const TXT = OUT.replace(/\.html?$/, '') + '.txt';
+    fs.writeFileSync(TXT, htmlText(html));
+    console.log('written', TXT, `${Math.round(fs.statSync(TXT).size / 1024)} KB — review it before publishing: every visible text, tables as rows, every URL and script`);
+}

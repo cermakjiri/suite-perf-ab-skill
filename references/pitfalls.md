@@ -231,7 +231,10 @@ property of today's code, not a guarantee.
 ### `performance.memory` has real precision and fake meaning
 
 Available on a plain https page, no flag needed, and byte-granular (no bucketing observed in
-Chrome 152). But it tracks allocation and GC history, not live data:
+Chrome 152). Not so in the rig's own browsers: in Playwright's Chromium 151 and in Electron it read
+a constant 29.75 MiB while 26 MiB of objects were retained (CDP's JSHeapUsedSize: 21.8 → 48.0 MiB)
+until `--enable-precise-memory-info` — which both launchers now pass (rig/launch.mjs; records from
+before read a frozen `heapPeak`). And it tracks allocation and GC history, not live data:
 
 - 20 × 50KB `Float64Array` allocations moved it by **exactly 0 bytes** — typed-array backing stores
   are external memory, not JS heap.

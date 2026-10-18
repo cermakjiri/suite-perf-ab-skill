@@ -8,7 +8,10 @@
  * the target branch moved since), and per side a fresh fingerprint of the build on disk
  * (rig/fingerprint.mjs): the commit it carries against the side's pinned one, the profile's codesign
  * flag, coverage, the React Compiler coverage; then what differs between the sides (compiler
- * coverage, the inherited guide content). The machine slot: which other run holds it.
+ * coverage, the inherited guide content), and the bundle comparison (rig/bundlediff.mjs, cached in
+ * run.json `bundles`): a target whose code is identical between the sides is unaffected — report it
+ * so, do not time it. The machine slot: which other run holds it. Power: battery or Low Power Mode
+ * is a BLOCK for timing (plan.mjs waits for AC before timing and control sessions), not for builds.
  *
  * Exit 1 when a check fails. Works inside the sandbox; with it on, `ps`, the docker socket and
  * local ports read "unknown" — run it outside for the full picture right before a timing plan.
@@ -18,9 +21,10 @@ import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { parseArgs, home, loadRun, sideOf, repoRoot, mainCheckout, resolveFromRepo, importFromRepo, nvmrcNode, git, exists, readJson, writeJson, loadavg, PROFILES, sideCommit } from './lib.mjs';
+import { parseArgs, home, loadRun, sideOf, repoRoot, mainCheckout, resolveFromRepo, importFromRepo, nvmrcNode, git, exists, readJson, writeJson, loadavg, PROFILES, sideCommit, powerState } from './lib.mjs';
 import { queue, holderText } from './locks.mjs';
 import { fingerprint, fingerprintText, compilerText } from './fingerprint.mjs';
+import { compareRun, bundlesText, PARTS } from './bundlediff.mjs';
 
 const args = parseArgs();
 const checks = [];
@@ -134,8 +138,9 @@ const main = async () => {
     } else {
         add('busy processes', 'warn', 'unknown (ps is blocked inside the sandbox)');
     }
-    const batt = out(['pmset', '-g', 'batt']);
-    if (batt) add('power', /AC Power/.test(batt) ? 'ok' : 'warn', /AC Power/.test(batt) ? 'AC' : 'battery: CPU scaling differs, plug in for timing');
+    // blocks timing, not the build: plan.mjs holds every timing and control session (power-wait) until AC
+    const pw = powerState();
+    add('power', pw.ok ? 'ok' : 'block', pw.ok ? `${pw.text}${pw.lowPower === null && pw.source !== 'unknown' ? ' (Low Power Mode unknown inside the sandbox)' : ''}` : `${pw.text} — the cores run at other clocks: timing and control sessions wait for AC power without Low Power Mode (plan.mjs power-wait); plug in before timing`);
     add('cpu', 'ok', `${os.cpus()[0] && os.cpus()[0].model}, ${Math.round(os.totalmem() / 1073741824)} GiB`);
     const p9222 = await portOpen(9222);
     add('port 9222', p9222 ? 'warn' : 'ok', p9222 === null ? 'unknown (sandbox)' : p9222 ? 'in use (another exploration or browser) — open.mjs takes the next free port, which the MCPs as configured do not see' : 'free (open.mjs + MCPs)');
@@ -224,10 +229,22 @@ const main = async () => {
             const guides = keys.map(k => run.sides[k].guide).filter(g => g !== undefined);
             if (guides.length > 1 && new Set(guides).size > 1) add('guide content', 'warn', `the inherited guide content differs between the clones (${keys.map(k => `${k} ${run.sides[k].guide || 'none'}`).join(', ')}): the guide markdown is bundled — rebuild the older clone (cleanup.mjs --clone=…, build.mjs) if a scenario opens the guide`);
         }
+        // the bundle comparison (build.mjs, rig/bundlediff.mjs; computed here when missing, cached in run.json)
+        try {
+            compareRun(run, Object.keys(PARTS));
+            const fresh = loadRun(args.run);
+            for (const [t, pairs] of Object.entries(fresh.bundles || {})) {
+                for (const [pair, r] of Object.entries(pairs)) add(`bundles ${t}`, r.identical ? 'warn' : 'ok', `${bundlesText(t, pair, r, 4)}${r.identical ? ' → the change does not reach this target: report it as unaffected, do not time it' : ''}`);
+            }
+        } catch (e) {
+            add('bundles', 'warn', `comparison failed: ${e.message.split('\n')[0]}`);
+        }
     }
 
-    const icon = { ok: '  ok ', warn: 'WARN ', fail: 'FAIL ' };
+    const icon = { ok: '  ok ', warn: 'WARN ', fail: 'FAIL ', block: 'BLOCK' };
     for (const c of checks) console.log(`${icon[c.status]} ${c.name.padEnd(18)} ${c.detail}`);
+    const blocked = checks.filter(c => c.status === 'block');
+    if (blocked.length) console.log(`timing is blocked by: ${blocked.map(c => c.name).join(', ')} — builds, counts and trial passes can go on; timing and control sessions wait`);
     if (run) writeJson(path.join(run.dir, 'preflight.json'), { at: new Date().toISOString(), checks });
     if (checks.some(c => c.status === 'fail')) process.exitCode = 1;
 };

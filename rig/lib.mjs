@@ -109,6 +109,20 @@ export const saveRun = run => {
     const { dir, file, ...rest } = run;
     writeJson(file, rest);
 };
+/**
+ * Merge-write run.json for a long-running writer (build.mjs): read the file again right before
+ * writing and let `mutate(fresh)` change only what that writer owns, so edits made meanwhile (title,
+ * scenario, cfg, …) survive. Returns the fresh run (with dir and file).
+ */
+export const updateRun = (run, mutate) => {
+    const fresh = Object.assign(readJson(run.file), { dir: run.dir, file: run.file });
+    // false: nothing to write
+    if (mutate(fresh) === false) return fresh;
+    const { dir, file, ...rest } = fresh;
+    writeJsonAtomic(file, rest);
+
+    return fresh;
+};
 // relative paths in run.json resolve against the run dir, `skill:` against the skill folder
 export const resolveIn = (dir, p) => {
     if (!p) return p;
@@ -230,6 +244,22 @@ export const median = values => {
     return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
 };
 export const mean = v => (v.length ? v.reduce((s, x) => s + x, 0) / v.length : null);
+/** Least-squares line through the points: { slope, intercept }, or null under two distinct x. */
+export const linearFit = (xs, ys) => {
+    if (xs.length < 2 || xs.length !== ys.length) return null;
+    const mx = mean(xs);
+    const my = mean(ys);
+    let sxx = 0;
+    let sxy = 0;
+    for (const [i, x] of xs.entries()) {
+        sxx += (x - mx) ** 2;
+        sxy += (x - mx) * (ys[i] - my);
+    }
+    if (!sxx) return null;
+    const slope = sxy / sxx;
+
+    return { slope, intercept: my - slope * mx };
+};
 const binom = (n, k) => {
     let r = 1;
     for (let i = 1; i <= k; i++) r = (r * (n - k + i)) / i;
@@ -303,9 +333,22 @@ export const called = d => !!d && !!d.separated && d.separated !== 'overlap' && 
 export const minP = (nA, nB) => (nA < 2 || nB < 2 ? 1 : permutationP(Array.from({ length: nA }, (_, i) => i), Array.from({ length: nB }, (_, i) => 1e6 + i)));
 // a paired control lands when the metric moves by roughly this share of the injected cost
 export const LANDED_PCT = [70, 110];
+/** A session's naive landing: the % of the injected cost its total.taskMs moved (median inject − median plain). */
+export const naiveLanding = c => (c.landed['total.taskMs'] || Object.values(c.landed)[0] || {}).landedPct;
+const has = (c, k) => !!(c[k] && Number.isFinite(c[k].landedPct));
+/**
+ * A session's landing as the verdict reads it: against its plain neighbours (`neighbour`: each injected
+ * iteration against the plain ones around it, median per session) when aggregate could pair them;
+ * else against the plain iterations' trend (`trend`, the cross-check); else the naive one (records
+ * aggregated before either existed).
+ */
+export const controlLanding = c => (has(c, 'neighbour') ? c.neighbour.landedPct : has(c, 'trend') ? c.trend.landedPct : naiveLanding(c));
+const rangeOf = pcts => ({ range: [Math.min(...pcts), Math.max(...pcts)], median: Math.round(median(pcts)) });
 /**
  * A paired control's verdict over its sessions (R.control of a pass x rate; a session's landing is
- * the % of the injected cost its total.taskMs moved, `pairs` its inject / no-inject iterations).
+ * controlLanding, `pairs` its inject / no-inject iterations). `basis` says which landing decided
+ * ('neighbour', 'trend' or 'naive': the first every session has); `trend` and `naive` keep the other
+ * ranges next to it.
  * One session swings about ±30 points, so only a consistent miss reads as a broken rig:
  *   underpowered  a session has fewer than 3 pairs — raise ctl k; not a failure
  *   failed        every session misses LANDED_PCT on the same side
@@ -313,13 +356,19 @@ export const LANDED_PCT = [70, 110];
  *   landed        every session inside the band
  */
 export const controlVerdict = control => {
-    const rows = Object.values(control || {}).flat().map(c => ({ pct: (c.landed['total.taskMs'] || Object.values(c.landed)[0] || {}).landedPct, pairs: c.pairs }));
+    const all = Object.values(control || {}).flat();
+    const basis = ['neighbour', 'trend'].find(k => all.length && all.every(c => has(c, k))) || 'naive';
+    const rows = all.map(c => ({ pct: basis === 'naive' ? naiveLanding(c) : c[basis].landedPct, pairs: c.pairs }));
     const pcts = finite(rows.map(r => r.pct));
     if (!pcts.length) return null;
     const [lo, hi] = LANDED_PCT;
     const pairs = finite(rows.map(r => r.pairs));
-    const med = Math.round(median(pcts));
-    const v = { range: [Math.min(...pcts), Math.max(...pcts)], median: med, sessions: pcts.length, pairs: pairs.length ? Math.min(...pairs) : null };
+    const v = Object.assign(rangeOf(pcts), { sessions: pcts.length, pairs: pairs.length ? Math.min(...pairs) : null, basis });
+    const trend = finite(all.map(c => (has(c, 'trend') ? c.trend.landedPct : null)));
+    if (basis === 'neighbour' && trend.length) v.trend = rangeOf(trend);
+    const naive = finite(all.map(naiveLanding));
+    if (basis !== 'naive' && naive.length) v.naive = rangeOf(naive);
+    const med = v.median;
     if (v.pairs !== null && v.pairs < 3) v.state = 'underpowered';
     else if (pcts.every(x => x < lo) || pcts.every(x => x > hi)) v.state = 'failed';
     else if (pcts.some(x => x < lo || x > hi) || med < lo || med > hi) v.state = 'inconclusive';
@@ -329,7 +378,8 @@ export const controlVerdict = control => {
 };
 /** "control inconclusive (sessions 66–125 %, median 110 %) — …", the same words in aggregate and report. */
 export const controlText = (v, where = '') => {
-    const nums = `sessions ${v.range[0]}–${v.range[1]} %, median ${v.median} %`;
+    const other = (r, name) => (r ? `; ${name} ${r.range[0]}–${r.range[1]} %` : '');
+    const nums = `${{ neighbour: 'paired with neighbours, ', trend: 'trend-corrected, ' }[v.basis] || ''}sessions ${v.range[0]}–${v.range[1]} %, median ${v.median} %${other(v.trend, 'trend fit')}${other(v.naive, 'naive')}`;
     const at = where ? ` ${where}` : '';
 
     return {
@@ -442,7 +492,7 @@ export const timingHistory = (outDir, roleOf = passRole) => {
         const m = f.match(SESSION_FILE);
         const d = m && tryJson(path.join(outDir, f));
         const t = d && d.complete === true && d.meta && d.meta.timing;
-        if (t && Number.isFinite(t.durationMs)) out.push({ id: f.slice(0, -5), pass: m[1], role: roleOf(m[1], d.meta), cfg: d.meta.cfg, side: m[3], k: d.meta.k, rates: d.meta.rates, finished: d.meta.finished, ...t });
+        if (t && Number.isFinite(t.durationMs)) out.push({ id: f.slice(0, -5), pass: m[1], role: roleOf(m[1], d.meta), cfg: d.meta.cfg, target: d.meta.target || 'web', side: m[3], k: d.meta.k, rates: d.meta.rates, finished: d.meta.finished, ...t });
     }
 
     return out;
@@ -450,17 +500,24 @@ export const timingHistory = (outDir, roleOf = passRole) => {
 /**
  * Session duration: overhead (fixed + per rate) + per rate, k x the wall time of one iteration at
  * that rate (the warm-up iterations are part of k). Learned from finished sessions in pools, in
- * order: the same pass; the same role and cfg; any timing or trial pass; counts and controls last.
- * An estimate that needs one of the last two pools, or a rate ratio never measured, is `rough`.
+ * order: the same pass; the same role, cfg and target; the same cfg and target in any measured role
+ * (the size pilot plan.mjs runs per cfg is a trial pass); any timing or trial pass; counts and
+ * controls last. Iteration time follows the workload's size, so an estimate from another cfg (one
+ * of the last two pools), or one that needs a rate ratio never measured, is `rough`; plan.mjs
+ * re-estimates a pass from its own first iterations as they finish.
  * A rate a pool has not run scales a rate it has by their ratio in sessions that ran both (1 if
  * none: wall time per iteration barely follows the throttle, 3.0-4.0 s at 1x vs 3.7-4.1 s at 4x).
  * Without history every estimate is null: say "ETA after the first session" instead of guessing.
- * s = { pass, role, cfg, k, rates }; estimates are { ms, rough } or null.
+ * s = { pass, role, cfg, k, rates, target }; estimates are { ms, rough } or null.
  */
+export const ROUGH_POOL = 3;
 export const etaModel = history => {
+    const sameTarget = (h, s) => !s.target || (h.target || 'web') === s.target;
+    const sameCfg = (h, s) => cfgKey(h.cfg) === cfgKey(s.cfg) && sameTarget(h, s);
     const pools = s => [
         history.filter(h => h.pass === s.pass),
-        history.filter(h => h.role === s.role && cfgKey(h.cfg) === cfgKey(s.cfg)),
+        history.filter(h => h.role === s.role && sameCfg(h, s)),
+        history.filter(h => h.role !== 'counts' && sameCfg(h, s)),
         history.filter(h => h.role === 'timing' || h.role === 'trial'),
         history,
     ];
@@ -474,13 +531,13 @@ export const etaModel = history => {
     const iterAt = (s, rate) => {
         for (const [i, pool] of pools(s).entries()) {
             const v = samples(pool, rate);
-            if (v.length) return { ms: median(v), rough: i >= 2 };
+            if (v.length) return { ms: median(v), rough: i >= ROUGH_POOL };
             const seen = [...new Set(pool.flatMap(h => Object.keys(h.iterMs || {}).filter(r => h.iterMs[r].length)))].map(Number);
             if (!seen.length) continue;
             const near = seen.toSorted((a, b) => Math.abs(Math.log(a / rate)) - Math.abs(Math.log(b / rate)))[0];
             const r = ratio(rate, near);
 
-            return { ms: median(samples(pool, near)) * r.x, rough: i >= 2 || !r.known };
+            return { ms: median(samples(pool, near)) * r.x, rough: i >= ROUGH_POOL || !r.known };
         }
 
         return null;
@@ -497,7 +554,7 @@ export const etaModel = history => {
             const perRate = n1 === n2 ? med(n1) / n1 : Math.max(0, (med(n2) - med(n1)) / (n2 - n1));
             const fixed = n1 === n2 ? 0 : Math.max(0, med(n1) - perRate * n1);
 
-            return { ms: fixed + perRate * s.rates.length, rough: i >= 2 };
+            return { ms: fixed + perRate * s.rates.length, rough: i >= ROUGH_POOL };
         }
 
         return null;
@@ -537,7 +594,23 @@ export const etaModel = history => {
         return { ms: Math.round(Math.max(est.ms - (now - startedMs), iters ? iters.ms : 0)), rough: est.rough };
     };
 
-    return { empty: !history.length, iterAt, overheadAt, sessionEst, leftEst };
+    /**
+     * One iteration's wall time for this workload from the exact pools only (the pass itself, or the
+     * size pilot of its cfg and target): at this rate, else the longest of the rates measured (wall
+     * time per iteration barely follows the throttle). null when only other workloads ran.
+     */
+    const refIter = (s, rate) => {
+        for (const pool of pools(s).slice(0, ROUGH_POOL)) {
+            const v = samples(pool, rate);
+            if (v.length) return median(v);
+            const other = [...new Set(pool.flatMap(h => Object.keys(h.iterMs || {})))].map(r => samples(pool, r)).filter(x => x.length).map(median);
+            if (other.length) return Math.max(...other);
+        }
+
+        return null;
+    };
+
+    return { empty: !history.length, iterAt, overheadAt, sessionEst, leftEst, refIter };
 };
 /** An estimate as text: '2:31', '~2:31' when rough, '–' when unknown. */
 export const estText = (e, hours = false) => (e ? `${e.rough ? '~' : ''}${dur(e.ms, hours)}` : '–');
@@ -547,6 +620,41 @@ export const sleep = ms => delay(ms);
 export const hhmmss = () => new Date().toTimeString().slice(0, 8);
 export const log = (...a) => console.log(hhmmss(), ...a);
 export const loadavg = () => os.loadavg().map(x => +x.toFixed(2));
+/**
+ * The power source and Low Power Mode, for the timing gate (plan.mjs), each session's record and
+ * preflight: { source: 'ac' | 'battery' | 'unknown', lowPower: true | false | null, ok, text }.
+ * macOS: `pmset -g batt` ("Now drawing from 'AC Power'" / 'Battery Power') and `pmset -g`
+ * (lowpowermode 1, or powermode 1 on Macs with a power-mode setting; the Bash sandbox hides those
+ * lines: null). A battery or Low Power Mode clocks the cores differently: `ok` is false and timing
+ * waits. PERF_AB_POWER=ac | battery | lowpower overrides the reading (to test the gate unplugged
+ * or plugged in).
+ */
+export const powerState = () => {
+    const forced = String(process.env.PERF_AB_POWER || '').toLowerCase();
+    let source = 'unknown';
+    let lowPower = null;
+    if (['ac', 'battery', 'lowpower'].includes(forced)) {
+        source = forced === 'battery' ? 'battery' : 'ac';
+        lowPower = forced === 'lowpower';
+    } else if (process.platform === 'darwin') {
+        try {
+            const batt = execFileSync('pmset', ['-g', 'batt'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
+            source = /'AC Power'/.test(batt) ? 'ac' : /'Battery Power'/.test(batt) ? 'battery' : 'unknown';
+            const g = execFileSync('pmset', ['-g'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
+            // powermode: 0 automatic, 1 low power, 2 high power
+            const m = g.match(/^\s*lowpowermode\s+(\d)/m) || g.match(/^\s*powermode\s+(\d)/m);
+            if (m) lowPower = m[1] === '1';
+        } catch {
+            // no pmset (or it failed): unknown, which never blocks
+        }
+    }
+    const ok = source !== 'battery' && lowPower !== true;
+    const text = `${{ ac: 'AC power', battery: 'battery', unknown: 'power source unknown' }[source]}${lowPower ? ', Low Power Mode' : ''}${forced && ['ac', 'battery', 'lowpower'].includes(forced) ? ' (PERF_AB_POWER)' : ''}`;
+
+    return { source, lowPower, ok, text, at: new Date().toISOString() };
+};
+/** A session's power record as one comparable word: 'ac', 'battery', 'ac+lowpower', … or null when unknown. */
+export const powerKey = p => (p && p.source && p.source !== 'unknown' ? `${p.source}${p.lowPower ? '+lowpower' : ''}` : null);
 /** A duration as m:ss, h:mm:ss from an hour on (or always with `hours`); '–' when unknown. */
 export const dur = (ms, hours = false) => {
     if (typeof ms !== 'number' || !Number.isFinite(ms)) return '–';

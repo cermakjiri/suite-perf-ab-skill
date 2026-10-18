@@ -39,7 +39,12 @@
  * build runs next to another run's page session. --rebuild refuses a clone that a live session or
  * exploration is serving. --slot=off skips the slot.
  *
- * Writes sha, buildSha, profile, clone, web, desktop, fingerprint and guide into run.json's sides.
+ * Writes sha, buildSha, profile, clone, web, desktop, fingerprint and guide into run.json's sides —
+ * a merge-write: the file is read again right before writing and nothing else changes, so edits
+ * made while it builds (title, pr, device, scenario, cfg, …) survive; a side re-pinned meanwhile gets
+ * no record of the old build. Then, for every target both sides have built, the bundle comparison
+ * (rig/bundlediff.mjs): code-identical apart from mangled names, hashes, commit and signed config,
+ * or the differing files — run.json `bundles`; a code-identical target is unaffected by the change.
  * --profile with --sides builds just those sides another way: a build-config A/B (the same commit in
  * two profiles); run.json's build.profile then stays the run's, and preflight and the report say the
  * sides differ.
@@ -60,9 +65,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { RIG, parseArgs, list, loadRun, saveRun, resolveIn, readJson, writeJson, writeJsonSafe, tryJson, exists, home, git, mainCheckout, repoRoot, log, nvmrcNode, median, dur, clock, PROFILES, profileOf } from './lib.mjs';
+import { RIG, parseArgs, list, loadRun, updateRun, resolveIn, readJson, writeJson, writeJsonSafe, tryJson, exists, home, git, mainCheckout, repoRoot, log, nvmrcNode, median, dur, clock, PROFILES, profileOf } from './lib.mjs';
 import { acquire, holderText, slotOff, cloneUsers } from './locks.mjs';
 import { fingerprint, fingerprintText, FP_VERSION } from './fingerprint.mjs';
+import { compareRun } from './bundlediff.mjs';
 
 const args = parseArgs();
 const run = loadRun(args.run);
@@ -130,6 +136,8 @@ const TARGET = {
     },
 };
 for (const t of TARGETS) if (!TARGET[t]) throw new Error(`unknown target ${t} (${Object.keys(TARGET).join(', ')})`);
+// the fields of a run.json side this script writes (and nothing else)
+const BUILD_OWNED = ['sha', 'buildSha', 'profile', 'clone', ...Object.keys(TARGET), 'fingerprint', 'guide'];
 
 // a child's output goes to its log file, or is collected when it has none — never to stdout
 let current = null;
@@ -478,25 +486,38 @@ const buildSide = async (job, later) => {
         writeJson(stateFile, state);
     }
     // run.json: this profile's clone only — a target this clone has not built is not taken from another profile
-    side.sha = sha;
-    if (state.buildSha && state.buildSha !== sha) side.buildSha = state.buildSha;
-    else delete side.buildSha;
-    Object.assign(side, { profile: PROFILE, clone });
-    side.fingerprint = {};
+    const owned = { sha, profile: PROFILE, clone, fingerprint: {}, guide: state.guide ?? null };
+    if (state.buildSha && state.buildSha !== sha) owned.buildSha = state.buildSha;
     for (const t of Object.keys(TARGET)) {
         const st = state.targets[t];
-        if (st && st.ok) {
-            side[t] = st.dir;
-            if (st.fingerprint) side.fingerprint[t] = compact(st.fingerprint);
-        } else {
-            delete side[t];
-        }
+        if (!st || !st.ok) continue;
+        owned[t] = st.dir;
+        if (st.fingerprint) owned.fingerprint[t] = compact(st.fingerprint);
     }
-    side.guide = state.guide ?? null;
     // the run's profile follows a build of every side; --profile with --sides builds those sides another
     // way on purpose (a build-config A/B: the same commit in two profiles)
-    if (!list(args.sides).length || !run.build || !run.build.profile) run.build = Object.assign({}, run.build, { profile: PROFILE });
-    saveRun(run);
+    const setProfile = !list(args.sides).length || !run.build || !run.build.profile;
+    // merge-write: run.json is read again right before writing and only what the build owns changes, so
+    // edits made while it built (title, pr, device, scenario, cfg, …) survive. A side re-pinned meanwhile
+    // keeps its new revision and gets no build record: this build is of the old one
+    let skipped = null;
+    const fresh = updateRun(run, r => {
+        const s = r.sides && r.sides[key];
+        if (!s || s.rev !== side.rev) {
+            skipped = !s ? `side ${key} is no longer in run.json` : `side ${key} was re-pinned while it built (${short(side.rev)} → ${short(s.rev)})`;
+
+            return false;
+        }
+        for (const f of BUILD_OWNED) {
+            if (owned[f] !== undefined) s[f] = owned[f];
+            else delete s[f];
+        }
+        if (setProfile) r.build = Object.assign({}, r.build, { profile: PROFILE });
+    });
+    if (skipped) log(`   ${skipped} — this build is not recorded in run.json; run build.mjs again for the new revision`);
+    // later sides and the last line read the file as it is now
+    for (const k of Object.keys(run)) if (!['dir', 'file'].includes(k)) delete run[k];
+    Object.assign(run, fresh);
 };
 
 try {
@@ -520,6 +541,13 @@ try {
             lock.release();
         }
     }
+    // both sides of a target built: is their code the same? (masked JS comparison, rig/bundlediff.mjs)
+    status.step = { name: 'bundle comparison' };
+    saveStatus();
+    const t0 = Date.now();
+    const compared = compareRun(run, TARGETS);
+    for (const l of compared) log(l);
+    if (compared.length) log(`   bundle comparison in ${dur(Date.now() - t0)} → run.json bundles${compared.some(l => / code-identical between sides/.test(l)) ? ' · a code-identical target is unaffected by the change: report it so, do not time it' : ''}`);
     Object.assign(status, { state: 'finished', side: null, step: null, waiting: null, etaMs: 0, etaAt: new Date().toISOString() });
     saveStatus();
 } catch (e) {
